@@ -17,236 +17,96 @@
 
 package org.apache.kafka.trogdor.agent;
 
+import com.fasterxml.jackson.databind.node.LongNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import net.sourceforge.argparse4j.ArgumentParsers;
 import net.sourceforge.argparse4j.inf.ArgumentParser;
 import net.sourceforge.argparse4j.inf.ArgumentParserException;
 import net.sourceforge.argparse4j.inf.Namespace;
+import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.utils.Exit;
-import org.apache.kafka.common.utils.KafkaThread;
+import org.apache.kafka.common.utils.Scheduler;
 import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.trogdor.common.JsonUtil;
 import org.apache.kafka.trogdor.common.Node;
 import org.apache.kafka.trogdor.common.Platform;
-import org.apache.kafka.trogdor.fault.Fault;
-import org.apache.kafka.trogdor.fault.FaultSet;
-import org.apache.kafka.trogdor.fault.FaultSpec;
-import org.apache.kafka.trogdor.fault.RunningState;
-import org.apache.kafka.trogdor.rest.AgentFaultsResponse;
-import org.apache.kafka.trogdor.rest.CreateAgentFaultRequest;
+import org.apache.kafka.trogdor.rest.AgentStatusResponse;
+import org.apache.kafka.trogdor.rest.CreateWorkerRequest;
+import org.apache.kafka.trogdor.rest.DestroyWorkerRequest;
 import org.apache.kafka.trogdor.rest.JsonRestServer;
+import org.apache.kafka.trogdor.rest.StopWorkerRequest;
+import org.apache.kafka.trogdor.task.TaskController;
+import org.apache.kafka.trogdor.task.TaskSpec;
+import org.apache.kafka.trogdor.rest.UptimeResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.TreeMap;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
+import java.io.PrintStream;
+import java.util.Set;
 
 import static net.sourceforge.argparse4j.impl.Arguments.store;
 
 /**
  * The Trogdor agent.
  *
- * The agent process implements faults directly.
+ * The agent process runs tasks.
  */
 public final class Agent {
     private static final Logger log = LoggerFactory.getLogger(Agent.class);
 
     /**
-     * The clock to use for this agent.
+     * The default Agent port.
      */
-    private final Time time;
+    public static final int DEFAULT_PORT = 8888;
 
     /**
-     * The time at which this server was started.
+     * The workerId to use in exec mode.
      */
-    private final long startTimeMs;
+    private static final long EXEC_WORKER_ID = 1;
 
     /**
-     * The platform.
+     * The taskId to use in exec mode.
+     */
+    private static final String EXEC_TASK_ID = "task0";
+
+    /**
+     * The platform object to use for this agent.
      */
     private final Platform platform;
 
     /**
-     * The lock protecting shutdown and faultSet.
+     * The time at which this server was started.
      */
-    private final ReentrantLock lock = new ReentrantLock();
+    private final long serverStartMs;
 
     /**
-     * The condition variable which the agent thread waits on.
+     * The WorkerManager.
      */
-    private final Condition cond = lock.newCondition();
-
-    /**
-     * The agent runnable.
-     */
-    private final AgentRunnable runnable;
+    private final WorkerManager workerManager;
 
     /**
      * The REST server.
      */
     private final JsonRestServer restServer;
 
-    /**
-     * The agent thread.
-     */
-    private final KafkaThread thread;
-
-    /**
-     * The set of pending faults.
-     */
-    private final FaultSet pendingFaults = new FaultSet();
-
-    /**
-     * The set of faults which are running.
-     */
-    private final FaultSet runningFaults = new FaultSet();
-
-    /**
-     * The set of faults which are done.
-     */
-    private final FaultSet doneFaults = new FaultSet();
-
-    /**
-     * True if the server is shutting down.
-     */
-    private boolean shutdown = false;
-
-    class AgentRunnable implements Runnable {
-        @Override
-        public void run() {
-            log.info("Starting main service thread.");
-            try {
-                while (true) {
-                    List<Fault> toStart = new ArrayList<>();
-                    List<Fault> started = new ArrayList<>();
-                    List<Fault> toEnd = new ArrayList<>();
-                    List<Fault> ended = new ArrayList<>();
-                    long now = time.milliseconds();
-                    long nextWakeMs = now + (60L * 60L * 1000L);
-                    lock.lock();
-                    try {
-                        Iterator<Fault> pending = pendingFaults.iterateByStart();
-                        while (pending.hasNext()) {
-                            Fault fault = pending.next();
-                            toStart.add(fault);
-                            long endMs = fault.spec().startMs() + fault.spec().durationMs();
-                            nextWakeMs = Math.min(nextWakeMs, endMs);
-                            pending.remove();
-                        }
-                        Iterator<Fault> running = runningFaults.iterateByEnd();
-                        while (running.hasNext()) {
-                            Fault fault = running.next();
-                            RunningState state = (RunningState) fault.state();
-                            long endMs = state.startedMs() + fault.spec().durationMs();
-                            if (now < endMs) {
-                                nextWakeMs = Math.min(nextWakeMs, endMs);
-                                break;
-                            }
-                            toEnd.add(fault);
-                            running.remove();
-                        }
-                    } finally {
-                        lock.unlock();
-                    }
-                    for (Fault fault: toStart) {
-                        try {
-                            log.debug("Activating fault " + fault);
-                            fault.activate(now, platform);
-                            started.add(fault);
-                        } catch (Throwable e) {
-                            log.error("Error activating fault " + fault.id(), e);
-                            ended.add(fault);
-                        }
-                    }
-                    for (Fault fault: toEnd) {
-                        try {
-                            log.debug("Deactivating fault " + fault);
-                            fault.deactivate(now, platform);
-                        } catch (Throwable e) {
-                            log.error("Error deactivating fault " + fault.id(), e);
-                        } finally {
-                            ended.add(fault);
-                        }
-                    }
-                    lock.lock();
-                    try {
-                        for (Fault fault : started) {
-                            runningFaults.add(fault);
-                        }
-                        for (Fault fault : ended) {
-                            doneFaults.add(fault);
-                        }
-                        if (shutdown) {
-                            return;
-                        }
-                        if (nextWakeMs > now) {
-                            log.trace("Sleeping for {} ms", nextWakeMs - now);
-                            if (cond.await(nextWakeMs - now, TimeUnit.MILLISECONDS)) {
-                                log.trace("AgentRunnable woke up early");
-                            }
-                        }
-                        if (shutdown) {
-                            return;
-                        }
-                    } finally {
-                        lock.unlock();
-                    }
-                }
-            } catch (Throwable t) {
-                log.error("Unhandled exception in AgentRunnable", t);
-            } finally {
-                log.info("AgentRunnable shutting down.");
-                restServer.stop();
-                int numDeactivated = deactivateRunningFaults();
-                log.info("AgentRunnable deactivated {} fault(s).", numDeactivated);
-            }
-        }
-    }
-
-    private int deactivateRunningFaults() {
-        long now = time.milliseconds();
-        int numDeactivated = 0;
-        lock.lock();
-        try {
-            for (Iterator<Fault> iter = runningFaults.iterateByStart(); iter.hasNext(); ) {
-                Fault fault = iter.next();
-                try {
-                    numDeactivated++;
-                    iter.remove();
-                    fault.deactivate(now, platform);
-                } catch (Exception e) {
-                    log.error("Got exception while deactivating {}", fault, e);
-                } finally {
-                    doneFaults.add(fault);
-                }
-            }
-        } finally {
-            lock.unlock();
-        }
-        return numDeactivated;
-    }
+    private final Time time;
 
     /**
      * Create a new Agent.
      *
      * @param platform      The platform object to use.
-     * @param time          The timekeeper to use for this Agent.
+     * @param scheduler     The scheduler to use for this Agent.
      * @param restServer    The REST server to use.
-     * @param resource      The AgentRestResoure to use.
+     * @param resource      The AgentRestResource to use.
      */
-    public Agent(Platform platform, Time time, JsonRestServer restServer,
-                 AgentRestResource resource) {
+    public Agent(Platform platform, Scheduler scheduler,
+                 JsonRestServer restServer, AgentRestResource resource) {
         this.platform = platform;
-        this.time = time;
+        this.time = scheduler.time();
+        this.serverStartMs = time.milliseconds();
+        this.workerManager = new WorkerManager(platform, scheduler);
         this.restServer = restServer;
-        this.startTimeMs = time.milliseconds();
-        this.runnable = new AgentRunnable();
-        this.thread = new KafkaThread("TrogdorAgentThread", runnable, false);
-        this.thread.start();
         resource.setAgent(this);
     }
 
@@ -254,63 +114,90 @@ public final class Agent {
         return this.restServer.port();
     }
 
-    public void beginShutdown() {
-        lock.lock();
+    public void beginShutdown() throws Exception {
+        restServer.beginShutdown();
+        workerManager.beginShutdown();
+    }
+
+    public void waitForShutdown() throws Exception {
+        restServer.waitForShutdown();
+        workerManager.waitForShutdown();
+    }
+
+    public AgentStatusResponse status() throws Exception {
+        return new AgentStatusResponse(serverStartMs, workerManager.workerStates());
+    }
+
+    public UptimeResponse uptime() {
+        return new UptimeResponse(serverStartMs, time.milliseconds());
+    }
+
+    public void createWorker(CreateWorkerRequest req) throws Throwable {
+        workerManager.createWorker(req.workerId(), req.taskId(), req.spec());
+    }
+
+    public void stopWorker(StopWorkerRequest req) throws Throwable {
+        workerManager.stopWorker(req.workerId(), false);
+    }
+
+    public void destroyWorker(DestroyWorkerRequest req) throws Throwable {
+        workerManager.stopWorker(req.workerId(), true);
+    }
+
+    /**
+     * Rebase the task spec time so that it is not earlier than the current time.
+     * This is only needed for tasks passed in with --exec.  Normally, the
+     * controller rebases the task spec time.
+     */
+    TaskSpec rebaseTaskSpecTime(TaskSpec spec) throws Exception {
+        ObjectNode node = JsonUtil.JSON_SERDE.valueToTree(spec);
+        node.set("startMs", new LongNode(Math.max(time.milliseconds(), spec.startMs())));
+        return JsonUtil.JSON_SERDE.treeToValue(node, TaskSpec.class);
+    }
+
+    /**
+     * Start a task on the agent, and block until it completes.
+     *
+     * @param spec          The task specifiction.
+     * @param out           The output stream to print to.
+     *
+     * @return              True if the task run successfully; false otherwise.
+     */
+    boolean exec(TaskSpec spec, PrintStream out) throws Exception {
+        TaskController controller = null;
         try {
-            if (shutdown)
-                return;
-            this.shutdown = true;
-            cond.signalAll();
-        } finally {
-            lock.unlock();
+            controller = spec.newController(EXEC_TASK_ID);
+        } catch (Exception e) {
+            out.println("Unable to create the task controller.");
+            e.printStackTrace(out);
+            return false;
         }
-    }
-
-    public void waitForShutdown() {
+        Set<String> nodes = controller.targetNodes(platform.topology());
+        if (!nodes.contains(platform.curNode().name())) {
+            out.println("This task is not configured to run on this node.  It runs on node(s): " +
+                Utils.join(nodes, ", ") + ", whereas this node is " +
+                platform.curNode().name());
+            return false;
+        }
+        KafkaFuture<String> future = null;
         try {
-            this.thread.join();
-        } catch (InterruptedException e) {
-            log.error("Interrupted while waiting for thread shutdown", e);
-            Thread.currentThread().interrupt();
+            future = workerManager.createWorker(EXEC_WORKER_ID, EXEC_TASK_ID, spec);
+        } catch (Throwable e) {
+            out.println("createWorker failed");
+            e.printStackTrace(out);
+            return false;
         }
-    }
-
-    public long startTimeMs() {
-        return startTimeMs;
-    }
-
-    public AgentFaultsResponse faults() {
-        Map<String, AgentFaultsResponse.FaultData> faultData = new TreeMap<>();
-        lock.lock();
-        try {
-            updateFaultsResponse(faultData, pendingFaults);
-            updateFaultsResponse(faultData, runningFaults);
-            updateFaultsResponse(faultData, doneFaults);
-        } finally {
-            lock.unlock();
-        }
-        return new AgentFaultsResponse(faultData);
-    }
-
-    private void updateFaultsResponse(Map<String, AgentFaultsResponse.FaultData> faultData,
-                                      FaultSet faultSet) {
-        for (Iterator<Fault> iter = faultSet.iterateByStart();
-                iter.hasNext(); ) {
-            Fault fault = iter.next();
-            AgentFaultsResponse.FaultData data =
-                new AgentFaultsResponse.FaultData(fault.spec(), fault.state());
-            faultData.put(fault.id(), data);
-        }
-    }
-
-    public void createFault(CreateAgentFaultRequest request) throws ClassNotFoundException {
-        lock.lock();
-        try {
-            Fault fault = FaultSpec.Util.createFault(request.id(), request.spec());
-            pendingFaults.add(fault);
-            cond.signalAll();
-        } finally {
-            lock.unlock();
+        out.println("Waiting for completion of task:" + JsonUtil.toPrettyJsonString(spec));
+        String error = future.get();
+        if (error == null || error.isEmpty()) {
+            out.println("Task succeeded with status " +
+                JsonUtil.toPrettyJsonString(workerManager.workerStates().get(EXEC_WORKER_ID).status()));
+            return true;
+        } else {
+            out.println("Task failed with status " +
+                JsonUtil.toPrettyJsonString(workerManager.workerStates().get(EXEC_WORKER_ID).status()) +
+                " and error " + error);
+            return false;
         }
     }
 
@@ -319,20 +206,26 @@ public final class Agent {
             .newArgumentParser("trogdor-agent")
             .defaultHelp(true)
             .description("The Trogdor fault injection agent");
-        parser.addArgument("--agent.config")
+        parser.addArgument("--agent.config", "-c")
             .action(store())
             .required(true)
             .type(String.class)
             .dest("config")
             .metavar("CONFIG")
             .help("The configuration file to use.");
-        parser.addArgument("--node-name")
+        parser.addArgument("--node-name", "-n")
             .action(store())
             .required(true)
             .type(String.class)
             .dest("node_name")
             .metavar("NODE_NAME")
             .help("The name of this node.");
+        parser.addArgument("--exec", "-e")
+            .action(store())
+            .type(String.class)
+            .dest("task_spec")
+            .metavar("TASK_SPEC")
+            .help("Execute a single task spec and then exit.  The argument is the task spec to load when starting up, or a path to it.");
         Namespace res = null;
         try {
             res = parser.parseArgs(args);
@@ -347,21 +240,36 @@ public final class Agent {
         }
         String configPath = res.getString("config");
         String nodeName = res.getString("node_name");
+        String taskSpec = res.getString("task_spec");
 
         Platform platform = Platform.Config.parse(nodeName, configPath);
         JsonRestServer restServer =
             new JsonRestServer(Node.Util.getTrogdorAgentPort(platform.curNode()));
         AgentRestResource resource = new AgentRestResource();
-        final Agent agent = new Agent(platform, Time.SYSTEM, restServer, resource);
+        log.info("Starting agent process.");
+        final Agent agent = new Agent(platform, Scheduler.SYSTEM, restServer, resource);
         restServer.start(resource);
-        Runtime.getRuntime().addShutdownHook(new Thread() {
-            @Override
-            public void run() {
-                log.error("Running shutdown hook...");
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            log.warn("Running agent shutdown hook.");
+            try {
                 agent.beginShutdown();
                 agent.waitForShutdown();
+            } catch (Exception e) {
+                log.error("Got exception while running agent shutdown hook.", e);
             }
-        });
+        }));
+        if (taskSpec != null) {
+            TaskSpec spec = null;
+            try {
+                spec = JsonUtil.objectFromCommandLineArgument(taskSpec, TaskSpec.class);
+            } catch (Exception e) {
+                System.out.println("Unable to parse the supplied task spec.");
+                e.printStackTrace();
+                Exit.exit(1);
+            }
+            TaskSpec effectiveSpec = agent.rebaseTaskSpecTime(spec);
+            Exit.exit(agent.exec(effectiveSpec, System.out) ? 0 : 1);
+        }
         agent.waitForShutdown();
     }
 };

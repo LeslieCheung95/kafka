@@ -17,6 +17,7 @@
 package org.apache.kafka.common.requests;
 
 import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.protocol.types.ArrayOf;
 import org.apache.kafka.common.protocol.types.Field;
 import org.apache.kafka.common.protocol.types.Schema;
@@ -24,7 +25,9 @@ import org.apache.kafka.common.protocol.types.Struct;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.apache.kafka.common.protocol.CommonFields.ERROR_CODE;
 import static org.apache.kafka.common.protocol.CommonFields.ERROR_MESSAGE;
@@ -39,8 +42,13 @@ public class CreateAclsResponse extends AbstractResponse {
                     ERROR_CODE,
                     ERROR_MESSAGE))));
 
+    /**
+     * The version number is bumped to indicate that, on quota violation, brokers send out responses before throttling.
+     */
+    private static final Schema CREATE_ACLS_RESPONSE_V1 = CREATE_ACLS_RESPONSE_V0;
+
     public static Schema[] schemaVersions() {
-        return new Schema[]{CREATE_ACLS_RESPONSE_V0};
+        return new Schema[]{CREATE_ACLS_RESPONSE_V0, CREATE_ACLS_RESPONSE_V1};
     }
 
     public static class AclCreationResponse {
@@ -93,6 +101,7 @@ public class CreateAclsResponse extends AbstractResponse {
         return struct;
     }
 
+    @Override
     public int throttleTimeMs() {
         return throttleTimeMs;
     }
@@ -101,7 +110,20 @@ public class CreateAclsResponse extends AbstractResponse {
         return aclCreationResponses;
     }
 
+    @Override
+    public Map<Errors, Integer> errorCounts() {
+        Map<Errors, Integer> errorCounts = new HashMap<>();
+        for (AclCreationResponse response : aclCreationResponses)
+            updateErrorCounts(errorCounts, response.error.error());
+        return errorCounts;
+    }
+
     public static CreateAclsResponse parse(ByteBuffer buffer, short version) {
         return new CreateAclsResponse(ApiKeys.CREATE_ACLS.responseSchema(version).read(buffer));
+    }
+
+    @Override
+    public boolean shouldClientThrottle(short version) {
+        return version >= 1;
     }
 }

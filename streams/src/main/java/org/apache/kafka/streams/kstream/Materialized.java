@@ -16,9 +16,9 @@
  */
 package org.apache.kafka.streams.kstream;
 
-import org.apache.kafka.common.internals.Topic;
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.internals.ApiUtils;
 import org.apache.kafka.streams.processor.StateStore;
 import org.apache.kafka.streams.state.KeyValueBytesStoreSupplier;
 import org.apache.kafka.streams.state.KeyValueStore;
@@ -28,15 +28,32 @@ import org.apache.kafka.streams.state.StoreSupplier;
 import org.apache.kafka.streams.state.WindowBytesStoreSupplier;
 import org.apache.kafka.streams.state.WindowStore;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 
+import static org.apache.kafka.streams.internals.ApiUtils.prepareMillisCheckFailMsgPrefix;
+
 /**
  * Used to describe how a {@link StateStore} should be materialized.
- * You can either provide a custom {@link StateStore} backend
- * through one of the provided methods accepting a supplier or use the default RocksDB backends
- * by providing just a store name.
+ * You can either provide a custom {@link StateStore} backend through one of the provided methods accepting a supplier
+ * or use the default RocksDB backends by providing just a store name.
+ * <p>
+ * For example, you can read a topic as {@link KTable} and force a state store materialization to access the content
+ * via Interactive Queries API:
+ * <pre>{@code
+ * StreamsBuilder builder = new StreamsBuilder();
+ * KTable<Integer, Integer> table = builder.table(
+ *   "topicName",
+ *   Materialized.as("queryable-store-name"));
+ * }</pre>
+ *
+ * @param <K> type of record key
+ * @param <V> type of record value
+ * @param <S> type of state store (note: state stores always have key/value types {@code <Bytes,byte[]>}
+ *
+ * @see org.apache.kafka.streams.state.Stores
  */
 public class Materialized<K, V, S extends StateStore> {
     protected StoreSupplier<S> storeSupplier;
@@ -46,6 +63,7 @@ public class Materialized<K, V, S extends StateStore> {
     protected boolean loggingEnabled = true;
     protected boolean cachingEnabled = true;
     protected Map<String, String> topicConfig = new HashMap<>();
+    protected Duration retention;
 
     private Materialized(final StoreSupplier<S> storeSupplier) {
         this.storeSupplier = storeSupplier;
@@ -67,6 +85,7 @@ public class Materialized<K, V, S extends StateStore> {
         this.loggingEnabled = materialized.loggingEnabled;
         this.cachingEnabled = materialized.cachingEnabled;
         this.topicConfig = materialized.topicConfig;
+        this.retention = materialized.retention;
     }
 
     /**
@@ -80,12 +99,16 @@ public class Materialized<K, V, S extends StateStore> {
      * @return a new {@link Materialized} instance with the given storeName
      */
     public static <K, V, S extends StateStore> Materialized<K, V, S> as(final String storeName) {
-        Topic.validate(storeName);
+        Named.validate(storeName);
         return new Materialized<>(storeName);
     }
 
     /**
      * Materialize a {@link WindowStore} using the provided {@link WindowBytesStoreSupplier}.
+     *
+     * Important: Custom subclasses are allowed here, but they should respect the retention contract:
+     * Window stores are required to retain windows at least as long as (window size + window grace period).
+     * Stores constructed via {@link org.apache.kafka.streams.state.Stores} already satisfy this contract.
      *
      * @param supplier the {@link WindowBytesStoreSupplier} used to materialize the store
      * @param <K>      key type of the store
@@ -99,6 +122,10 @@ public class Materialized<K, V, S extends StateStore> {
 
     /**
      * Materialize a {@link SessionStore} using the provided {@link SessionBytesStoreSupplier}.
+     *
+     * Important: Custom subclasses are allowed here, but they should respect the retention contract:
+     * Session stores are required to retain windows at least as long as (session inactivity gap + session grace period).
+     * Stores constructed via {@link org.apache.kafka.streams.state.Stores} already satisfy this contract.
      *
      * @param supplier the {@link SessionBytesStoreSupplier} used to materialize the store
      * @param <K>      key type of the store
@@ -125,10 +152,29 @@ public class Materialized<K, V, S extends StateStore> {
     }
 
     /**
+     * Materialize a {@link StateStore} with the provided key and value {@link Serde}s.
+     * An internal name will be used for the store.
+     *
+     * @param keySerde      the key {@link Serde} to use. If the {@link Serde} is null, then the default key
+     *                      serde from configs will be used
+     * @param valueSerde    the value {@link Serde} to use. If the {@link Serde} is null, then the default value
+     *                      serde from configs will be used
+     * @param <K>           key type
+     * @param <V>           value type
+     * @param <S>           store type
+     * @return a new {@link Materialized} instance with the given key and value serdes
+     */
+    public static <K, V, S extends StateStore> Materialized<K, V, S> with(final Serde<K> keySerde,
+                                                                          final Serde<V> valueSerde) {
+        return new Materialized<K, V, S>((String) null).withKeySerde(keySerde).withValueSerde(valueSerde);
+    }
+
+    /**
      * Set the valueSerde the materialized {@link StateStore} will use.
      *
      * @param valueSerde the value {@link Serde} to use. If the {@link Serde} is null, then the default value
-     *                   serde from configs will be used
+     *                   serde from configs will be used. If the serialized bytes is null for put operations,
+     *                   it is treated as delete operation
      * @return itself
      */
     public Materialized<K, V, S> withValueSerde(final Serde<V> valueSerde) {
@@ -189,4 +235,27 @@ public class Materialized<K, V, S extends StateStore> {
         return this;
     }
 
+    /**
+     * Configure retention period for window and session stores. Ignored for key/value stores.
+     *
+     * Overridden by pre-configured store suppliers
+     * ({@link Materialized#as(SessionBytesStoreSupplier)} or {@link Materialized#as(WindowBytesStoreSupplier)}).
+     *
+     * Note that the retention period must be at least long enough to contain the windowed data's entire life cycle,
+     * from window-start through window-end, and for the entire grace period.
+     *
+     * @param retention the retention time
+     * @return itself
+     * @throws IllegalArgumentException if retention is negative or can't be represented as {@code long milliseconds}
+     */
+    public Materialized<K, V, S> withRetention(final Duration retention) throws IllegalArgumentException {
+        final String msgPrefix = prepareMillisCheckFailMsgPrefix(retention, "retention");
+        final long retenationMs = ApiUtils.validateMillisecondDuration(retention, msgPrefix);
+
+        if (retenationMs < 0) {
+            throw new IllegalArgumentException("Retention must not be negative.");
+        }
+        this.retention = retention;
+        return this;
+    }
 }

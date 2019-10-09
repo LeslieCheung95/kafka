@@ -31,30 +31,32 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import static org.apache.kafka.common.protocol.CommonFields.PRODUCER_EPOCH;
+import static org.apache.kafka.common.protocol.CommonFields.PRODUCER_ID;
 import static org.apache.kafka.common.protocol.CommonFields.TOPIC_NAME;
-import static org.apache.kafka.common.protocol.types.Type.INT16;
+import static org.apache.kafka.common.protocol.CommonFields.TRANSACTIONAL_ID;
 import static org.apache.kafka.common.protocol.types.Type.INT32;
-import static org.apache.kafka.common.protocol.types.Type.INT64;
-import static org.apache.kafka.common.protocol.types.Type.STRING;
 
 public class AddPartitionsToTxnRequest extends AbstractRequest {
-    private static final String TRANSACTIONAL_ID_KEY_NAME = "transactional_id";
-    private static final String PRODUCER_ID_KEY_NAME = "producer_id";
-    private static final String PRODUCER_EPOCH_KEY_NAME = "producer_epoch";
     private static final String TOPICS_KEY_NAME = "topics";
     private static final String PARTITIONS_KEY_NAME = "partitions";
 
     private static final Schema ADD_PARTITIONS_TO_TXN_REQUEST_V0 = new Schema(
-            new Field(TRANSACTIONAL_ID_KEY_NAME, STRING, "The transactional id corresponding to the transaction."),
-            new Field(PRODUCER_ID_KEY_NAME, INT64, "Current producer id in use by the transactional id."),
-            new Field(PRODUCER_EPOCH_KEY_NAME, INT16, "Current epoch associated with the producer id."),
+            TRANSACTIONAL_ID,
+            PRODUCER_ID,
+            PRODUCER_EPOCH,
             new Field(TOPICS_KEY_NAME, new ArrayOf(new Schema(
                     TOPIC_NAME,
                     new Field(PARTITIONS_KEY_NAME, new ArrayOf(INT32)))),
                     "The partitions to add to the transaction."));
 
+    /**
+     * The version number is bumped to indicate that on quota violation brokers send out responses before throttling.
+     */
+    private static final Schema ADD_PARTITIONS_TO_TXN_REQUEST_V1 = ADD_PARTITIONS_TO_TXN_REQUEST_V0;
+
     public static Schema[] schemaVersions() {
-        return new Schema[]{ADD_PARTITIONS_TO_TXN_REQUEST_V0};
+        return new Schema[]{ADD_PARTITIONS_TO_TXN_REQUEST_V0, ADD_PARTITIONS_TO_TXN_REQUEST_V1};
     }
 
     public static class Builder extends AbstractRequest.Builder<AddPartitionsToTxnRequest> {
@@ -100,7 +102,7 @@ public class AddPartitionsToTxnRequest extends AbstractRequest {
 
     private AddPartitionsToTxnRequest(short version, String transactionalId, long producerId, short producerEpoch,
                                       List<TopicPartition> partitions) {
-        super(version);
+        super(ApiKeys.ADD_PARTITIONS_TO_TXN, version);
         this.transactionalId = transactionalId;
         this.producerId = producerId;
         this.producerEpoch = producerEpoch;
@@ -108,10 +110,10 @@ public class AddPartitionsToTxnRequest extends AbstractRequest {
     }
 
     public AddPartitionsToTxnRequest(Struct struct, short version) {
-        super(version);
-        this.transactionalId = struct.getString(TRANSACTIONAL_ID_KEY_NAME);
-        this.producerId = struct.getLong(PRODUCER_ID_KEY_NAME);
-        this.producerEpoch = struct.getShort(PRODUCER_EPOCH_KEY_NAME);
+        super(ApiKeys.ADD_PARTITIONS_TO_TXN, version);
+        this.transactionalId = struct.get(TRANSACTIONAL_ID);
+        this.producerId = struct.get(PRODUCER_ID);
+        this.producerEpoch = struct.get(PRODUCER_EPOCH);
 
         List<TopicPartition> partitions = new ArrayList<>();
         Object[] topicPartitionsArray = struct.getArray(TOPICS_KEY_NAME);
@@ -144,11 +146,11 @@ public class AddPartitionsToTxnRequest extends AbstractRequest {
     @Override
     protected Struct toStruct() {
         Struct struct = new Struct(ApiKeys.ADD_PARTITIONS_TO_TXN.requestSchema(version()));
-        struct.set(TRANSACTIONAL_ID_KEY_NAME, transactionalId);
-        struct.set(PRODUCER_ID_KEY_NAME, producerId);
-        struct.set(PRODUCER_EPOCH_KEY_NAME, producerEpoch);
+        struct.set(TRANSACTIONAL_ID, transactionalId);
+        struct.set(PRODUCER_ID, producerId);
+        struct.set(PRODUCER_EPOCH, producerEpoch);
 
-        Map<String, List<Integer>> mappedPartitions = CollectionUtils.groupDataByTopic(partitions);
+        Map<String, List<Integer>> mappedPartitions = CollectionUtils.groupPartitionsByTopic(partitions);
         Object[] partitionsArray = new Object[mappedPartitions.size()];
         int i = 0;
         for (Map.Entry<String, List<Integer>> topicAndPartitions : mappedPartitions.entrySet()) {

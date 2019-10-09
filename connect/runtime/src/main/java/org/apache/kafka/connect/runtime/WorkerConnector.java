@@ -18,14 +18,15 @@ package org.apache.kafka.connect.runtime;
 
 import org.apache.kafka.connect.connector.Connector;
 import org.apache.kafka.connect.connector.ConnectorContext;
-import org.apache.kafka.connect.runtime.AbstractStatus.State;
-import org.apache.kafka.connect.runtime.ConnectMetrics.IndicatorPredicate;
 import org.apache.kafka.connect.runtime.ConnectMetrics.MetricGroup;
 import org.apache.kafka.connect.sink.SinkConnector;
+import org.apache.kafka.connect.source.SourceConnector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Container for connectors which is responsible for managing their lifecycle (e.g. handling startup,
@@ -75,6 +76,9 @@ public class WorkerConnector {
         try {
             this.config = connectorConfig.originalsStrings();
             log.debug("{} Initializing connector {} with config {}", this, connName, config);
+            if (isSinkConnector()) {
+                SinkConnectorConfig.validate(config);
+            }
 
             connector.initialize(new ConnectorContext() {
                 @Override
@@ -84,7 +88,7 @@ public class WorkerConnector {
 
                 @Override
                 public void raiseError(Exception e) {
-                    log.error("{} Connector raised an error", this, e);
+                    log.error("{} Connector raised an error", WorkerConnector.this, e);
                     onFailure(e);
                     ctx.raiseError(e);
                 }
@@ -136,6 +140,7 @@ public class WorkerConnector {
         return state == State.STARTED;
     }
 
+    @SuppressWarnings("fallthrough")
     private void pause() {
         try {
             switch (state) {
@@ -171,6 +176,8 @@ public class WorkerConnector {
             log.error("{} Error while shutting down connector", this, t);
             this.state = State.FAILED;
             statusListener.onFailure(connName, t);
+        } finally {
+            metrics.close();
         }
     }
 
@@ -197,6 +204,18 @@ public class WorkerConnector {
         return SinkConnector.class.isAssignableFrom(connector.getClass());
     }
 
+    public boolean isSourceConnector() {
+        return SourceConnector.class.isAssignableFrom(connector.getClass());
+    }
+
+    protected String connectorType() {
+        if (isSinkConnector())
+            return "sink";
+        if (isSourceConnector())
+            return "source";
+        return "unknown";
+    }
+
     public Connector connector() {
         return connector;
     }
@@ -212,7 +231,7 @@ public class WorkerConnector {
                        '}';
     }
 
-    class ConnectorMetricsGroup implements ConnectorStatus.Listener {
+    class ConnectorMetricsGroup implements ConnectorStatus.Listener, AutoCloseable {
         /**
          * Use {@link AbstractStatus.State} since it has all of the states we want,
          * unlike {@link WorkerConnector.State}.
@@ -222,26 +241,26 @@ public class WorkerConnector {
         private final ConnectorStatus.Listener delegate;
 
         public ConnectorMetricsGroup(ConnectMetrics connectMetrics, AbstractStatus.State initialState, ConnectorStatus.Listener delegate) {
+            Objects.requireNonNull(connectMetrics);
+            Objects.requireNonNull(connector);
+            Objects.requireNonNull(initialState);
+            Objects.requireNonNull(delegate);
             this.delegate = delegate;
             this.state = initialState;
-            this.metricGroup = connectMetrics.group("connector-metrics",
-                    "connector", connName);
+            ConnectMetricsRegistry registry = connectMetrics.registry();
+            this.metricGroup = connectMetrics.group(registry.connectorGroupName(),
+                    registry.connectorTagName(), connName);
+            // prevent collisions by removing any previously created metrics in this group.
+            metricGroup.close();
 
-            addStateMetric(AbstractStatus.State.RUNNING, "status-running",
-                    "Signals whether the connector task is in the running state.");
-            addStateMetric(AbstractStatus.State.PAUSED, "status-paused",
-                    "Signals whether the connector task is in the paused state.");
-            addStateMetric(AbstractStatus.State.FAILED, "status-failed",
-                    "Signals whether the connector task is in the failed state.");
+            metricGroup.addImmutableValueMetric(registry.connectorType, connectorType());
+            metricGroup.addImmutableValueMetric(registry.connectorClass, connector.getClass().getName());
+            metricGroup.addImmutableValueMetric(registry.connectorVersion, connector.version());
+            metricGroup.addValueMetric(registry.connectorStatus, now -> state.toString().toLowerCase(Locale.getDefault()));
         }
 
-        private void addStateMetric(final AbstractStatus.State matchingState, String name, String description) {
-            metricGroup.addIndicatorMetric(name, description, new IndicatorPredicate() {
-                @Override
-                public boolean matches() {
-                    return state == matchingState;
-                }
-            });
+        public void close() {
+            metricGroup.close();
         }
 
         @Override
@@ -294,6 +313,10 @@ public class WorkerConnector {
 
         boolean isFailed() {
             return state == AbstractStatus.State.FAILED;
+        }
+
+        protected MetricGroup metricGroup() {
+            return metricGroup;
         }
     }
 }

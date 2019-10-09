@@ -74,11 +74,16 @@ public class DescribeLogDirsResponse extends AbstractResponse {
                                             "(if it is the current log for the partition) or current replica's LEO " +
                                             "(if it is the future log for the partition)"),
                                     new Field(IS_FUTURE_KEY_NAME, BOOLEAN, "True if this log is created by " +
-                                            "AlterReplicaDirRequest and will replace the current log of the replica " +
+                                            "AlterReplicaLogDirsRequest and will replace the current log of the replica " +
                                             "in the future.")))))))))));
 
+    /**
+     * The version number is bumped to indicate that on quota violation brokers send out responses before throttling.
+     */
+    private static final Schema DESCRIBE_LOG_DIRS_RESPONSE_V1 = DESCRIBE_LOG_DIRS_RESPONSE_V0;
+
     public static Schema[] schemaVersions() {
-        return new Schema[]{DESCRIBE_LOG_DIRS_RESPONSE_V0};
+        return new Schema[]{DESCRIBE_LOG_DIRS_RESPONSE_V0, DESCRIBE_LOG_DIRS_RESPONSE_V1};
     }
 
     private final int throttleTimeMs;
@@ -132,7 +137,7 @@ public class DescribeLogDirsResponse extends AbstractResponse {
             logDirStruct.set(ERROR_CODE, logDirInfo.error.code());
             logDirStruct.set(LOG_DIR_KEY_NAME, logDirInfosEntry.getKey());
 
-            Map<String, Map<Integer, ReplicaInfo>> replicaInfosByTopic = CollectionUtils.groupDataByTopic(logDirInfo.replicaInfos);
+            Map<String, Map<Integer, ReplicaInfo>> replicaInfosByTopic = CollectionUtils.groupPartitionDataByTopic(logDirInfo.replicaInfos);
             List<Struct> topicStructArray = new ArrayList<>();
             for (Map.Entry<String, Map<Integer, ReplicaInfo>> replicaInfosByTopicEntry : replicaInfosByTopic.entrySet()) {
                 Struct topicStruct = logDirStruct.instance(TOPICS_KEY_NAME);
@@ -158,8 +163,17 @@ public class DescribeLogDirsResponse extends AbstractResponse {
         return struct;
     }
 
+    @Override
     public int throttleTimeMs() {
         return throttleTimeMs;
+    }
+
+    @Override
+    public Map<Errors, Integer> errorCounts() {
+        Map<Errors, Integer> errorCounts = new HashMap<>();
+        for (LogDirInfo logDirInfo : logDirInfos.values())
+            updateErrorCounts(errorCounts, logDirInfo.error);
+        return errorCounts;
     }
 
     public Map<String, LogDirInfo> logDirInfos() {
@@ -183,6 +197,17 @@ public class DescribeLogDirsResponse extends AbstractResponse {
         public LogDirInfo(Errors error, Map<TopicPartition, ReplicaInfo> replicaInfos) {
             this.error = error;
             this.replicaInfos = replicaInfos;
+        }
+
+        @Override
+        public String toString() {
+            StringBuilder builder = new StringBuilder();
+            builder.append("(error=")
+                    .append(error)
+                    .append(", replicas=")
+                    .append(replicaInfos)
+                    .append(")");
+            return builder.toString();
         }
     }
 
@@ -210,5 +235,10 @@ public class DescribeLogDirsResponse extends AbstractResponse {
                 .append(")");
             return builder.toString();
         }
+    }
+
+    @Override
+    public boolean shouldClientThrottle(short version) {
+        return version >= 1;
     }
 }

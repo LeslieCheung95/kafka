@@ -21,27 +21,39 @@ import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.processor.StateStore;
 import org.apache.kafka.streams.state.StoreSupplier;
 
+import java.time.Duration;
 import java.util.Map;
 
 public class MaterializedInternal<K, V, S extends StateStore> extends Materialized<K, V, S> {
 
-    private final boolean queryable;
+    private final boolean queriable;
 
     public MaterializedInternal(final Materialized<K, V, S> materialized) {
-        this(materialized, true);
+        this(materialized, null, null);
     }
-    
+
     public MaterializedInternal(final Materialized<K, V, S> materialized,
-                                final boolean queryable) {
+                                final InternalNameProvider nameProvider,
+                                final String generatedStorePrefix) {
         super(materialized);
-        this.queryable = queryable;
+
+        // if storeName is not provided, the corresponding KTable would never be queryable;
+        // but we still need to provide an internal name for it in case we materialize.
+        queriable = storeName() != null;
+        if (!queriable && nameProvider != null) {
+            storeName = nameProvider.newStoreName(generatedStorePrefix);
+        }
+    }
+
+    public String queryableStoreName() {
+        return queriable ? storeName() : null;
     }
 
     public String storeName() {
-        if (storeName != null) {
-            return storeName;
+        if (storeSupplier != null) {
+            return storeSupplier.name();
         }
-        return storeSupplier.name();
+        return storeName;
     }
 
     public StoreSupplier<S> storeSupplier() {
@@ -60,15 +72,15 @@ public class MaterializedInternal<K, V, S extends StateStore> extends Materializ
         return loggingEnabled;
     }
 
-    public Map<String, String> logConfig() {
+    Map<String, String> logConfig() {
         return topicConfig;
     }
 
-    boolean cachingEnabled() {
+    public boolean cachingEnabled() {
         return cachingEnabled;
     }
 
-    boolean isQueryable() {
-        return queryable;
+    Duration retention() {
+        return retention;
     }
 }

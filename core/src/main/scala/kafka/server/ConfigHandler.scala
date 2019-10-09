@@ -21,66 +21,66 @@ import java.util.Properties
 
 import DynamicConfig.Broker._
 import kafka.api.ApiVersion
+import kafka.controller.KafkaController
 import kafka.log.{LogConfig, LogManager}
 import kafka.security.CredentialProvider
 import kafka.server.Constants._
 import kafka.server.QuotaFactory.QuotaManagers
-import kafka.utils.Implicits._
 import kafka.utils.Logging
 import org.apache.kafka.common.config.ConfigDef.Validator
 import org.apache.kafka.common.config.ConfigException
-import org.apache.kafka.common.metrics.{Quota, Sanitizer}
+import org.apache.kafka.common.metrics.Quota
 import org.apache.kafka.common.metrics.Quota._
+import org.apache.kafka.common.utils.Sanitizer
 
 import scala.collection.JavaConverters._
+import scala.collection.Seq
+import scala.util.Try
 
 /**
   * The ConfigHandler is used to process config change notifications received by the DynamicConfigManager
   */
 trait ConfigHandler {
-  def processConfigChanges(entityName: String, value: Properties)
+  def processConfigChanges(entityName: String, value: Properties): Unit
 }
 
 /**
   * The TopicConfigHandler will process topic config changes in ZK.
   * The callback provides the topic name and the full properties set read from ZK
   */
-class TopicConfigHandler(private val logManager: LogManager, kafkaConfig: KafkaConfig, val quotas: QuotaManagers) extends ConfigHandler with Logging  {
+class TopicConfigHandler(private val logManager: LogManager, kafkaConfig: KafkaConfig, val quotas: QuotaManagers, kafkaController: KafkaController) extends ConfigHandler with Logging  {
 
-  def processConfigChanges(topic: String, topicConfig: Properties) {
+  def processConfigChanges(topic: String, topicConfig: Properties): Unit = {
     // Validate the configurations.
     val configNamesToExclude = excludedConfigs(topic, topicConfig)
 
-    val logs = logManager.logsByTopicPartition.filterKeys(_.topic == topic).values.toBuffer
+    val logs = logManager.logsByTopic(topic).toBuffer
     if (logs.nonEmpty) {
       /* combine the default properties with the overrides in zk to create the new LogConfig */
       val props = new Properties()
-      props ++= logManager.defaultConfig.originals.asScala
       topicConfig.asScala.foreach { case (key, value) =>
         if (!configNamesToExclude.contains(key)) props.put(key, value)
       }
-      val logConfig = LogConfig(props)
-      if ((topicConfig.containsKey(LogConfig.RetentionMsProp) 
-        || topicConfig.containsKey(LogConfig.MessageTimestampDifferenceMaxMsProp))
-        && logConfig.retentionMs < logConfig.messageTimestampDifferenceMaxMs)
-        warn(s"${LogConfig.RetentionMsProp} for topic $topic is set to ${logConfig.retentionMs}. It is smaller than " + 
-          s"${LogConfig.MessageTimestampDifferenceMaxMsProp}'s value ${logConfig.messageTimestampDifferenceMaxMs}. " +
-          s"This may result in frequent log rolling.")
-      logs.foreach(_.config = logConfig)
+      val logConfig = LogConfig.fromProps(logManager.currentDefaultConfig.originals, props)
+      logs.foreach(_.updateConfig(topicConfig.asScala.keySet, logConfig))
     }
 
     def updateThrottledList(prop: String, quotaManager: ReplicationQuotaManager) = {
       if (topicConfig.containsKey(prop) && topicConfig.getProperty(prop).length > 0) {
         val partitions = parseThrottledPartitions(topicConfig, kafkaConfig.brokerId, prop)
         quotaManager.markThrottled(topic, partitions)
-        logger.debug(s"Setting $prop on broker ${kafkaConfig.brokerId} for topic: $topic and partitions $partitions")
+        debug(s"Setting $prop on broker ${kafkaConfig.brokerId} for topic: $topic and partitions $partitions")
       } else {
         quotaManager.removeThrottle(topic)
-        logger.debug(s"Removing $prop from broker ${kafkaConfig.brokerId} for topic $topic")
+        debug(s"Removing $prop from broker ${kafkaConfig.brokerId} for topic $topic")
       }
     }
     updateThrottledList(LogConfig.LeaderReplicationThrottledReplicasProp, quotas.leader)
     updateThrottledList(LogConfig.FollowerReplicationThrottledReplicasProp, quotas.follower)
+
+    if (Try(topicConfig.getProperty(KafkaConfig.UncleanLeaderElectionEnableProp).toBoolean).getOrElse(false)) {
+      kafkaController.enableTopicUncleanLeaderElection(topic)
+    }
   }
 
   def parseThrottledPartitions(topicConfig: Properties, brokerId: Int, prop: String): Seq[Int] = {
@@ -96,7 +96,7 @@ class TopicConfigHandler(private val logManager: LogManager, kafkaConfig: KafkaC
         .map(_ (0).toInt).toSeq //convert to list of partition ids
     }
   }
-  
+
   def excludedConfigs(topic: String, topicConfig: Properties): Set[String] = {
     // Verify message format version
     Option(topicConfig.getProperty(LogConfig.MessageFormatVersionProp)).flatMap { versionString =>
@@ -117,25 +117,26 @@ class TopicConfigHandler(private val logManager: LogManager, kafkaConfig: KafkaC
  */
 class QuotaConfigHandler(private val quotaManagers: QuotaManagers) {
 
-  def updateQuotaConfig(sanitizedUser: Option[String], sanitizedClientId: Option[String], config: Properties) {
+  def updateQuotaConfig(sanitizedUser: Option[String], sanitizedClientId: Option[String], config: Properties): Unit = {
+    val clientId = sanitizedClientId.map(Sanitizer.desanitize)
     val producerQuota =
       if (config.containsKey(DynamicConfig.Client.ProducerByteRateOverrideProp))
         Some(new Quota(config.getProperty(DynamicConfig.Client.ProducerByteRateOverrideProp).toLong, true))
       else
         None
-    quotaManagers.produce.updateQuota(sanitizedUser, sanitizedClientId, producerQuota)
+    quotaManagers.produce.updateQuota(sanitizedUser, clientId, sanitizedClientId, producerQuota)
     val consumerQuota =
       if (config.containsKey(DynamicConfig.Client.ConsumerByteRateOverrideProp))
         Some(new Quota(config.getProperty(DynamicConfig.Client.ConsumerByteRateOverrideProp).toLong, true))
       else
         None
-    quotaManagers.fetch.updateQuota(sanitizedUser, sanitizedClientId, consumerQuota)
+    quotaManagers.fetch.updateQuota(sanitizedUser, clientId, sanitizedClientId, consumerQuota)
     val requestQuota =
       if (config.containsKey(DynamicConfig.Client.RequestPercentageOverrideProp))
         Some(new Quota(config.getProperty(DynamicConfig.Client.RequestPercentageOverrideProp).toDouble, true))
       else
         None
-    quotaManagers.request.updateQuota(sanitizedUser, sanitizedClientId, requestQuota)
+    quotaManagers.request.updateQuota(sanitizedUser, clientId, sanitizedClientId, requestQuota)
   }
 }
 
@@ -145,7 +146,7 @@ class QuotaConfigHandler(private val quotaManagers: QuotaManagers) {
  */
 class ClientIdConfigHandler(private val quotaManagers: QuotaManagers) extends QuotaConfigHandler(quotaManagers) with ConfigHandler {
 
-  def processConfigChanges(sanitizedClientId: String, clientConfig: Properties) {
+  def processConfigChanges(sanitizedClientId: String, clientConfig: Properties): Unit = {
     updateQuotaConfig(None, Some(sanitizedClientId), clientConfig)
   }
 }
@@ -157,7 +158,7 @@ class ClientIdConfigHandler(private val quotaManagers: QuotaManagers) extends Qu
  */
 class UserConfigHandler(private val quotaManagers: QuotaManagers, val credentialProvider: CredentialProvider) extends QuotaConfigHandler(quotaManagers) with ConfigHandler {
 
-  def processConfigChanges(quotaEntityPath: String, config: Properties) {
+  def processConfigChanges(quotaEntityPath: String, config: Properties): Unit = {
     // Entity path is <user> or <user>/clients/<client>
     val entities = quotaEntityPath.split("/")
     if (entities.length != 1 && entities.length != 3)
@@ -175,18 +176,23 @@ class UserConfigHandler(private val quotaManagers: QuotaManagers, val credential
   * The callback provides the brokerId and the full properties set read from ZK.
   * This implementation reports the overrides to the respective ReplicationQuotaManager objects
   */
-class BrokerConfigHandler(private val brokerConfig: KafkaConfig, private val quotaManagers: QuotaManagers) extends ConfigHandler with Logging {
+class BrokerConfigHandler(private val brokerConfig: KafkaConfig,
+                          private val quotaManagers: QuotaManagers) extends ConfigHandler with Logging {
 
-  def processConfigChanges(brokerId: String, properties: Properties) {
+  def processConfigChanges(brokerId: String, properties: Properties): Unit = {
     def getOrDefault(prop: String): Long = {
       if (properties.containsKey(prop))
         properties.getProperty(prop).toLong
       else
         DefaultReplicationThrottledRate
     }
-    if (brokerConfig.brokerId == brokerId.trim.toInt) {
+    if (brokerId == ConfigEntityName.Default)
+      brokerConfig.dynamicConfig.updateDefaultConfig(properties)
+    else if (brokerConfig.brokerId == brokerId.trim.toInt) {
+      brokerConfig.dynamicConfig.updateBrokerConfig(brokerConfig.brokerId, properties)
       quotaManagers.leader.updateQuota(upperBound(getOrDefault(LeaderReplicationThrottledRateProp)))
       quotaManagers.follower.updateQuota(upperBound(getOrDefault(FollowerReplicationThrottledRateProp)))
+      quotaManagers.alterLogDirs.updateQuota(upperBound(getOrDefault(ReplicaAlterLogDirsIoMaxBytesPerSecondProp)))
     }
   }
 }
@@ -200,7 +206,7 @@ object ThrottledReplicaListValidator extends Validator {
       if (!(proposed.forall(_.toString.trim.matches("([0-9]+:[0-9]+)?"))
         || proposed.headOption.exists(_.toString.trim.equals("*"))))
         throw new ConfigException(name, value,
-          s"$name must be the literal '*' or a list of replicas in the following format: [partitionId],[brokerId]:[partitionId],[brokerId]:...")
+          s"$name must be the literal '*' or a list of replicas in the following format: [partitionId]:[brokerId],[partitionId]:[brokerId],...")
     }
     value match {
       case scalaSeq: Seq[_] => check(scalaSeq)
@@ -209,6 +215,6 @@ object ThrottledReplicaListValidator extends Validator {
     }
   }
 
-  override def toString: String = "[partitionId],[brokerId]:[partitionId],[brokerId]:..."
+  override def toString: String = "[partitionId]:[brokerId],[partitionId]:[brokerId],..."
 
 }

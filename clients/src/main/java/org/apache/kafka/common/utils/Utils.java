@@ -24,8 +24,6 @@ import java.io.Closeable;
 import java.io.DataOutput;
 import java.io.EOFException;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
@@ -41,10 +39,12 @@ import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.text.DecimalFormat;
+import java.text.DecimalFormatSymbols;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -52,21 +52,33 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
-public class Utils {
+public final class Utils {
+
+    private Utils() {}
 
     // This matches URIs of formats: host:port and protocol:\\host:port
     // IPv6 is supported with [ip] pattern
     private static final Pattern HOST_PORT_PATTERN = Pattern.compile(".*?\\[?([0-9a-zA-Z\\-%._:]*)\\]?:([0-9]+)");
 
+    private static final Pattern VALID_HOST_CHARACTERS = Pattern.compile("([0-9a-zA-Z\\-%._:]*)");
+
     // Prints up to 2 decimal digits. Used for human readable printing
-    private static final DecimalFormat TWO_DIGIT_FORMAT = new DecimalFormat("0.##");
+    private static final DecimalFormat TWO_DIGIT_FORMAT = new DecimalFormat("0.##",
+        DecimalFormatSymbols.getInstance(Locale.ENGLISH));
 
     private static final String[] BYTE_SCALE_SUFFIXES = new String[] {"B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"};
 
@@ -109,6 +121,17 @@ public class Utils {
     }
 
     /**
+     * Read a UTF8 string from the current position till the end of a byte buffer. The position of the byte buffer is
+     * not affected by this method.
+     *
+     * @param buffer The buffer to read from
+     * @return The UTF8 string
+     */
+    public static String utf8(ByteBuffer buffer) {
+        return utf8(buffer, buffer.remaining());
+    }
+
+    /**
      * Read a UTF8 string from a byte buffer at a given offset. Note that the position of the byte buffer
      * is not affected by this method.
      *
@@ -148,7 +171,7 @@ public class Utils {
      * @param rest The remaining values to compare
      * @return The minimum of all passed values
      */
-    public static long min(long first, long ... rest) {
+    public static long min(long first, long... rest) {
         long min = first;
         for (long r : rest) {
             if (r < min)
@@ -163,7 +186,7 @@ public class Utils {
      * @param rest The remaining values to compare
      * @return The maximum of all passed values
      */
-    public static long max(long first, long ... rest) {
+    public static long max(long first, long... rest) {
         long max = first;
         for (long r : rest) {
             if (r > max)
@@ -256,17 +279,12 @@ public class Utils {
     }
 
     /**
-     * Check that the parameter t is not null
-     *
-     * @param t The object to check
-     * @return t if it isn't null
-     * @throws NullPointerException if t is null.
+     * Returns a copy of src byte array
+     * @param src The byte array to copy
+     * @return The copy
      */
-    public static <T> T notNull(T t) {
-        if (t == null)
-            throw new NullPointerException();
-        else
-            return t;
+    public static byte[] copyArray(byte[] src) {
+        return Arrays.copyOf(src, src.length);
     }
 
     /**
@@ -301,11 +319,22 @@ public class Utils {
      * Look up the class by name and instantiate it.
      * @param klass class name
      * @param base super class of the class to be instantiated
-     * @param <T>
+     * @param <T> the type of the base class
      * @return the new instance
      */
     public static <T> T newInstance(String klass, Class<T> base) throws ClassNotFoundException {
-        return Utils.newInstance(Class.forName(klass, true, Utils.getContextOrKafkaClassLoader()).asSubclass(base));
+        return Utils.newInstance(loadClass(klass, base));
+    }
+
+    /**
+     * Look up a class by name.
+     * @param klass class name
+     * @param base super class of the class for verification
+     * @param <T> the type of the base class
+     * @return the new class
+     */
+    public static <T> Class<? extends T> loadClass(String klass, Class<T> base) throws ClassNotFoundException {
+        return Class.forName(klass, true, Utils.getContextOrKafkaClassLoader()).asSubclass(base);
     }
 
     /**
@@ -327,6 +356,7 @@ public class Utils {
                 argTypes[i] = (Class<?>) params[2 * i];
                 args[i] = params[(2 * i) + 1];
             }
+            @SuppressWarnings("unchecked")
             Constructor<T> constructor = (Constructor<T>) c.getConstructor(argTypes);
             return constructor.newInstance(args);
         } catch (NoSuchMethodException e) {
@@ -349,6 +379,7 @@ public class Utils {
      * @param data byte array to hash
      * @return 32 bit hash of the given array
      */
+    @SuppressWarnings("fallthrough")
     public static int murmur2(final byte[] data) {
         int length = data.length;
         int seed = 0x9747b28c;
@@ -410,6 +441,15 @@ public class Utils {
     }
 
     /**
+     * Basic validation of the supplied address. checks for valid characters
+     * @param address hostname string to validate
+     * @return true if address contains valid characters
+     */
+    public static boolean validHostPattern(String address) {
+        return VALID_HOST_CHARACTERS.matcher(address).matches();
+    }
+
+    /**
      * Formats hostname and port number as a "host:port" address string,
      * surrounding IPv6 addresses with braces '[', ']'
      * @param host hostname
@@ -429,7 +469,7 @@ public class Utils {
      */
     public static String formatBytes(long bytes) {
         if (bytes < 0) {
-            return "" + bytes;
+            return String.valueOf(bytes);
         }
         double asDouble = (double) bytes;
         int ordinal = (int) Math.floor(Math.log(asDouble) / Math.log(1024.0));
@@ -440,7 +480,7 @@ public class Utils {
             return formatted + " " + BYTE_SCALE_SUFFIXES[ordinal];
         } catch (IndexOutOfBoundsException e) {
             //huge number?
-            return "" + asDouble;
+            return String.valueOf(asDouble);
         }
     }
 
@@ -461,6 +501,7 @@ public class Utils {
      * @return The string representation.
      */
     public static <T> String join(Collection<T> list, String separator) {
+        Objects.requireNonNull(list);
         StringBuilder sb = new StringBuilder();
         Iterator<T> iter = list.iterator();
         while (iter.hasNext()) {
@@ -471,6 +512,12 @@ public class Utils {
         return sb.toString();
     }
 
+    /**
+     *  Converts a {@code Map} class into a string, concatenating keys and values
+     *  Example:
+     *      {@code mkString({ key: "hello", keyTwo: "hi" }, "|START|", "|END|", "=", ",")
+     *          => "|START|key=hello,keyTwo=hi|END|"}
+     */
     public static <K, V> String mkString(Map<K, V> map, String begin, String end,
                                          String keyValueSeparator, String elementSeparator) {
         StringBuilder bld = new StringBuilder();
@@ -486,14 +533,40 @@ public class Utils {
     }
 
     /**
+     *  Converts an extensions string into a {@code Map<String, String>}.
+     *
+     *  Example:
+     *      {@code parseMap("key=hey,keyTwo=hi,keyThree=hello", "=", ",") => { key: "hey", keyTwo: "hi", keyThree: "hello" }}
+     *
+     */
+    public static Map<String, String> parseMap(String mapStr, String keyValueSeparator, String elementSeparator) {
+        Map<String, String> map = new HashMap<>();
+
+        if (!mapStr.isEmpty()) {
+            String[] attrvals = mapStr.split(elementSeparator);
+            for (String attrval : attrvals) {
+                String[] array = attrval.split(keyValueSeparator, 2);
+                map.put(array[0], array[1]);
+            }
+        }
+        return map;
+    }
+
+    /**
      * Read a properties file from the given path
      * @param filename The path of the file to read
      */
-    public static Properties loadProps(String filename) throws IOException, FileNotFoundException {
+    public static Properties loadProps(String filename) throws IOException {
         Properties props = new Properties();
-        try (InputStream propStream = new FileInputStream(filename)) {
-            props.load(propStream);
+
+        if (filename != null) {
+            try (InputStream propStream = Files.newInputStream(Paths.get(filename))) {
+                props.load(propStream);
+            }
+        } else {
+            System.out.println("Did not load any properties since the property file is not specified");
         }
+
         return props;
     }
 
@@ -516,15 +589,6 @@ public class Utils {
         PrintWriter pw = new PrintWriter(sw);
         e.printStackTrace(pw);
         return sw.toString();
-    }
-
-    /**
-     * Print an error message and shutdown the JVM
-     * @param message The error message
-     */
-    public static void croak(String message) {
-        System.err.println(message);
-        Exit.exit(1);
     }
 
     /**
@@ -557,8 +621,7 @@ public class Utils {
     public static String readFileAsString(String path, Charset charset) throws IOException {
         if (charset == null) charset = Charset.defaultCharset();
 
-        try (FileInputStream stream = new FileInputStream(new File(path))) {
-            FileChannel fc = stream.getChannel();
+        try (FileChannel fc = FileChannel.open(Paths.get(path))) {
             MappedByteBuffer bb = fc.map(FileChannel.MapMode.READ_ONLY, 0, fc.size());
             return charset.decode(bb).toString();
         }
@@ -593,18 +656,69 @@ public class Utils {
      */
     @SafeVarargs
     public static <T> Set<T> mkSet(T... elems) {
-        return new HashSet<>(Arrays.asList(elems));
+        Set<T> result = new HashSet<>((int) (elems.length / 0.75) + 1);
+        for (T elem : elems)
+            result.add(elem);
+        return result;
     }
 
-    /*
-     * Creates a list
-     * @param elems the elements
-     * @param <T> the type of element
-     * @return List
+    /**
+     * Creates a map entry (for use with {@link Utils#mkMap(java.util.Map.Entry[])})
+     *
+     * @param k   The key
+     * @param v   The value
+     * @param <K> The key type
+     * @param <V> The value type
+     * @return An entry
+     */
+    public static <K, V> Map.Entry<K, V> mkEntry(final K k, final V v) {
+        return new Map.Entry<K, V>() {
+            @Override
+            public K getKey() {
+                return k;
+            }
+
+            @Override
+            public V getValue() {
+                return v;
+            }
+
+            @Override
+            public V setValue(final V value) {
+                throw new UnsupportedOperationException();
+            }
+        };
+    }
+
+    /**
+     * Creates a map from a sequence of entries
+     *
+     * @param entries The entries to map
+     * @param <K>     The key type
+     * @param <V>     The value type
+     * @return A map
      */
     @SafeVarargs
-    public static <T> List<T> mkList(T... elems) {
-        return Arrays.asList(elems);
+    public static <K, V> Map<K, V> mkMap(final Map.Entry<K, V>... entries) {
+        final LinkedHashMap<K, V> result = new LinkedHashMap<>();
+        for (final Map.Entry<K, V> entry : entries) {
+            result.put(entry.getKey(), entry.getValue());
+        }
+        return result;
+    }
+
+    /**
+     * Creates a {@link Properties} from a map
+     *
+     * @param properties A map of properties to add
+     * @return The properties object
+     */
+    public static Properties mkProperties(final Map<String, String> properties) {
+        final Properties result = new Properties();
+        for (final Map.Entry<String, String> entry : properties.entrySet()) {
+            result.setProperty(entry.getKey(), entry.getValue());
+        }
+        return result;
     }
 
     /**
@@ -644,7 +758,7 @@ public class Utils {
      * @return
      */
     public static <T> List<T> safe(List<T> other) {
-        return other == null ? Collections.<T>emptyList() : other;
+        return other == null ? Collections.emptyList() : other;
     }
 
    /**
@@ -724,6 +838,17 @@ public class Utils {
         }
     }
 
+    public static void closeQuietly(AutoCloseable closeable, String name, AtomicReference<Throwable> firstException) {
+        if (closeable != null) {
+            try {
+                closeable.close();
+            } catch (Throwable t) {
+                firstException.compareAndSet(null, t);
+                log.error("Failed to close {} with type {}", name, closeable.getClass().getName(), t);
+            }
+        }
+    }
+
     /**
      * A cheap way to deterministically convert a number to a positive value. When the input is
      * positive, the original value is returned. When the input number is negative, the returned
@@ -739,10 +864,6 @@ public class Utils {
      */
     public static int toPositive(int number) {
         return number & 0x7fffffff;
-    }
-
-    public static int longHashcode(long value) {
-        return (int) (value ^ (value >>> 32));
     }
 
     /**
@@ -872,4 +993,49 @@ public class Utils {
         return res;
     }
 
+    public static <T> List<T> concatListsUnmodifiable(List<T> left, List<T> right) {
+        return concatLists(left, right, Collections::unmodifiableList);
+    }
+
+    public static <T> List<T> concatLists(List<T> left, List<T> right, Function<List<T>, List<T>> finisher) {
+        return Stream.concat(left.stream(), right.stream())
+                .collect(Collectors.collectingAndThen(Collectors.toList(), finisher));
+    }
+
+    public static int to32BitField(final Set<Byte> bytes) {
+        int value = 0;
+        for (final byte b : bytes)
+            value |= 1 << checkRange(b);
+        return value;
+    }
+
+    private static byte checkRange(final byte i) {
+        if (i > 31)
+            throw new IllegalArgumentException("out of range: i>31, i = " + i);
+        if (i < 0)
+            throw new IllegalArgumentException("out of range: i<0, i = " + i);
+        return i;
+    }
+
+    public static Set<Byte> from32BitField(final int intValue) {
+        Set<Byte> result = new HashSet<>();
+        for (int itr = intValue, count = 0; itr != 0; itr >>>= 1) {
+            if ((itr & 1) != 0)
+                result.add((byte) count);
+            count++;
+        }
+        return result;
+    }
+
+    public static <K1, V1, K2, V2> Map<K2, V2> transformMap(
+            Map<? extends K1, ? extends V1> map,
+            Function<K1, K2> keyMapper,
+            Function<V1, V2> valueMapper) {
+        return map.entrySet().stream().collect(
+            Collectors.toMap(
+                entry -> keyMapper.apply(entry.getKey()),
+                entry -> valueMapper.apply(entry.getValue())
+            )
+        );
+    }
 }

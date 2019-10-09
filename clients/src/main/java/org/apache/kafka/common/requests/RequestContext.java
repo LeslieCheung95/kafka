@@ -17,19 +17,21 @@
 package org.apache.kafka.common.requests;
 
 import org.apache.kafka.common.errors.InvalidRequestException;
+import org.apache.kafka.common.message.ApiVersionsRequestData;
 import org.apache.kafka.common.network.ListenerName;
 import org.apache.kafka.common.network.Send;
 import org.apache.kafka.common.protocol.ApiKeys;
-import org.apache.kafka.common.protocol.SecurityProtocol;
 import org.apache.kafka.common.protocol.types.Struct;
 import org.apache.kafka.common.security.auth.KafkaPrincipal;
+import org.apache.kafka.common.security.auth.SecurityProtocol;
 
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
+import org.apache.kafka.server.authorizer.AuthorizableRequestContext;
 
 import static org.apache.kafka.common.protocol.ApiKeys.API_VERSIONS;
 
-public class RequestContext {
+public class RequestContext implements AuthorizableRequestContext {
     public final RequestHeader header;
     public final String connectionId;
     public final InetAddress clientAddress;
@@ -54,7 +56,7 @@ public class RequestContext {
     public RequestAndSize parseRequest(ByteBuffer buffer) {
         if (isUnsupportedApiVersionsRequest()) {
             // Unsupported ApiVersion requests are treated as v0 requests and are not parsed
-            ApiVersionsRequest apiVersionsRequest = new ApiVersionsRequest((short) 0, header.apiVersion());
+            ApiVersionsRequest apiVersionsRequest = new ApiVersionsRequest(new ApiVersionsRequestData(), (short) 0, header.apiVersion());
             return new RequestAndSize(apiVersionsRequest, 0);
         } else {
             ApiKeys apiKey = header.apiKey();
@@ -75,17 +77,57 @@ public class RequestContext {
 
     public Send buildResponse(AbstractResponse body) {
         ResponseHeader responseHeader = header.toResponseHeader();
-        short version = header.apiVersion();
-
-        // Use v0 when serializing an unhandled ApiVersion response
-        if (isUnsupportedApiVersionsRequest())
-            version = 0;
-
-        return body.toSend(connectionId, responseHeader, version);
+        return body.toSend(connectionId, responseHeader, apiVersion());
     }
 
     private boolean isUnsupportedApiVersionsRequest() {
         return header.apiKey() == API_VERSIONS && !API_VERSIONS.isVersionSupported(header.apiVersion());
     }
 
+    public short apiVersion() {
+        // Use v0 when serializing an unhandled ApiVersion response
+        if (isUnsupportedApiVersionsRequest())
+            return 0;
+        return header.apiVersion();
+    }
+
+    @Override
+    public String listenerName() {
+        return listenerName.value();
+    }
+
+    @Override
+    public SecurityProtocol securityProtocol() {
+        return securityProtocol;
+    }
+
+    @Override
+    public KafkaPrincipal principal() {
+        return principal;
+    }
+
+    @Override
+    public InetAddress clientAddress() {
+        return clientAddress;
+    }
+
+    @Override
+    public int requestType() {
+        return header.apiKey().id;
+    }
+
+    @Override
+    public int requestVersion() {
+        return header.apiVersion();
+    }
+
+    @Override
+    public String clientId() {
+        return header.clientId();
+    }
+
+    @Override
+    public int correlationId() {
+        return header.correlationId();
+    }
 }

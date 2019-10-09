@@ -19,14 +19,16 @@ package org.apache.kafka.streams.processor.internals;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.InvalidOffsetException;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.TimeoutException;
 import org.apache.kafka.common.utils.LogContext;
-import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.errors.StreamsException;
 import org.apache.kafka.streams.processor.StateRestoreListener;
 import org.slf4j.Logger;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -40,149 +42,205 @@ import java.util.Set;
 public class StoreChangelogReader implements ChangelogReader {
 
     private final Logger log;
-    private final Consumer<byte[], byte[]> consumer;
-    private final StateRestoreListener stateRestoreListener;
-    private final Map<TopicPartition, Long> endOffsets = new HashMap<>();
+    private final Consumer<byte[], byte[]> restoreConsumer;
+    private final StateRestoreListener userStateRestoreListener;
+    private final Map<TopicPartition, Long> restoreToOffsets = new HashMap<>();
     private final Map<String, List<PartitionInfo>> partitionInfo = new HashMap<>();
     private final Map<TopicPartition, StateRestorer> stateRestorers = new HashMap<>();
-    private final Map<TopicPartition, StateRestorer> needsRestoring = new HashMap<>();
-    private final Map<TopicPartition, StateRestorer> needsInitializing = new HashMap<>();
+    private final Set<TopicPartition> needsRestoring = new HashSet<>();
+    private final Set<TopicPartition> needsInitializing = new HashSet<>();
+    private final Set<TopicPartition> completedRestorers = new HashSet<>();
+    private final Duration pollTime;
 
-    public StoreChangelogReader(final String threadId,
-                                final Consumer<byte[], byte[]> consumer,
-                                final StateRestoreListener stateRestoreListener,
+    public StoreChangelogReader(final Consumer<byte[], byte[]> restoreConsumer,
+                                final Duration pollTime,
+                                final StateRestoreListener userStateRestoreListener,
                                 final LogContext logContext) {
-        this.consumer = consumer;
+        this.restoreConsumer = restoreConsumer;
+        this.pollTime = pollTime;
         this.log = logContext.logger(getClass());
-        this.stateRestoreListener = stateRestoreListener;
-    }
-
-    public StoreChangelogReader(final Consumer<byte[], byte[]> consumer,
-                                final StateRestoreListener stateRestoreListener,
-                                final LogContext logContext) {
-        this("", consumer, stateRestoreListener, logContext);
+        this.userStateRestoreListener = userStateRestoreListener;
     }
 
     @Override
     public void register(final StateRestorer restorer) {
-        restorer.setGlobalRestoreListener(stateRestoreListener);
-        stateRestorers.put(restorer.partition(), restorer);
-        needsInitializing.put(restorer.partition(), restorer);
+        if (!stateRestorers.containsKey(restorer.partition())) {
+            restorer.setUserRestoreListener(userStateRestoreListener);
+            stateRestorers.put(restorer.partition(), restorer);
+
+            log.trace("Added restorer for changelog {}", restorer.partition());
+        }
+
+        needsInitializing.add(restorer.partition());
     }
 
-    public Collection<TopicPartition> restore() {
+    public Collection<TopicPartition> restore(final RestoringTasks active) {
         if (!needsInitializing.isEmpty()) {
-            initialize();
+            initialize(active);
         }
 
-        if (needsRestoring.isEmpty()) {
-            consumer.assign(Collections.<TopicPartition>emptyList());
-            return completed();
+        if (checkForCompletedRestoration()) {
+            return completedRestorers;
         }
 
-        final Set<TopicPartition> partitions = new HashSet<>(needsRestoring.keySet());
-        final ConsumerRecords<byte[], byte[]> allRecords = consumer.poll(10);
-        for (final TopicPartition partition : partitions) {
-            restorePartition(allRecords, partition);
+        try {
+            final ConsumerRecords<byte[], byte[]> records = restoreConsumer.poll(pollTime);
+
+            for (final TopicPartition partition : needsRestoring) {
+                final StateRestorer restorer = stateRestorers.get(partition);
+                final long pos = processNext(records.records(partition), restorer, restoreToOffsets.get(partition));
+                restorer.setRestoredOffset(pos);
+                if (restorer.hasCompleted(pos, restoreToOffsets.get(partition))) {
+                    restorer.restoreDone();
+                    restoreToOffsets.remove(partition);
+                    completedRestorers.add(partition);
+                }
+            }
+        } catch (final InvalidOffsetException recoverableException) {
+            log.warn("Restoring StreamTasks failed. Deleting StreamTasks stores to recreate from scratch.", recoverableException);
+            final Set<TopicPartition> partitions = recoverableException.partitions();
+            for (final TopicPartition partition : partitions) {
+                final StreamTask task = active.restoringTaskFor(partition);
+                log.info("Reinitializing StreamTask {} for changelog {}", task, partition);
+
+                needsInitializing.remove(partition);
+                needsRestoring.remove(partition);
+
+                final StateRestorer restorer = stateRestorers.get(partition);
+                restorer.setCheckpointOffset(StateRestorer.NO_CHECKPOINT);
+                task.reinitializeStateStoresForPartitions(recoverableException.partitions());
+            }
+            restoreConsumer.seekToBeginning(partitions);
         }
 
-        if (needsRestoring.isEmpty()) {
-            consumer.assign(Collections.<TopicPartition>emptyList());
-        }
+        needsRestoring.removeAll(completedRestorers);
 
-        return completed();
+        checkForCompletedRestoration();
+
+        return completedRestorers;
     }
 
-    private void initialize() {
-        if (!consumer.subscription().isEmpty()) {
-            throw new IllegalStateException("Restore consumer should not be subscribed to any topics (" + consumer.subscription() + ")");
+    private void initialize(final RestoringTasks active) {
+        if (!restoreConsumer.subscription().isEmpty()) {
+            throw new StreamsException("Restore consumer should not be subscribed to any topics (" + restoreConsumer.subscription() + ")");
         }
 
         // first refresh the changelog partition information from brokers, since initialize is only called when
         // the needsInitializing map is not empty, meaning we do not know the metadata for some of them yet
         refreshChangelogInfo();
 
-        Map<TopicPartition, StateRestorer> initializable = new HashMap<>();
-        for (Map.Entry<TopicPartition, StateRestorer> entry : needsInitializing.entrySet()) {
-            final TopicPartition topicPartition = entry.getKey();
+        final Set<TopicPartition> initializable = new HashSet<>();
+        for (final TopicPartition topicPartition : needsInitializing) {
             if (hasPartition(topicPartition)) {
-                initializable.put(entry.getKey(), entry.getValue());
+                initializable.add(topicPartition);
             }
         }
 
         // try to fetch end offsets for the initializable restorers and remove any partitions
         // where we already have all of the data
+        final Map<TopicPartition, Long> endOffsets;
         try {
-            endOffsets.putAll(consumer.endOffsets(initializable.keySet()));
+            endOffsets = restoreConsumer.endOffsets(initializable);
         } catch (final TimeoutException e) {
             // if timeout exception gets thrown we just give up this time and retry in the next run loop
             log.debug("Could not fetch end offset for {}; will fall back to partition by partition fetching", initializable);
             return;
         }
 
-        final Iterator<TopicPartition> iter = initializable.keySet().iterator();
-        while (iter.hasNext()) {
-            final TopicPartition topicPartition = iter.next();
-            final Long endOffset = endOffsets.get(topicPartition);
-
-            // offset should not be null; but since the consumer API does not guarantee it
-            // we add this check just in case
+        endOffsets.forEach((partition, endOffset) -> {
             if (endOffset != null) {
-                final StateRestorer restorer = needsInitializing.get(topicPartition);
-                if (restorer.checkpoint() >= endOffset) {
-                    restorer.setRestoredOffset(restorer.checkpoint());
-                    iter.remove();
-                } else if (restorer.offsetLimit() == 0 || endOffset == 0) {
-                    restorer.setRestoredOffset(0);
-                    iter.remove();
-                } else {
-                    restorer.setEndingOffset(endOffset);
-                }
-                needsInitializing.remove(topicPartition);
+                final StateRestorer restorer = stateRestorers.get(partition);
+                final long offsetLimit = restorer.offsetLimit();
+                restoreToOffsets.put(partition, Math.min(endOffset, offsetLimit));
             } else {
                 log.info("End offset cannot be found form the returned metadata; removing this partition from the current run loop");
-                iter.remove();
+                initializable.remove(partition);
             }
+        });
+
+        final Iterator<TopicPartition> iter = initializable.iterator();
+        while (iter.hasNext()) {
+            final TopicPartition topicPartition = iter.next();
+            final Long restoreOffset = restoreToOffsets.get(topicPartition);
+            final StateRestorer restorer = stateRestorers.get(topicPartition);
+
+            if (restorer.checkpoint() >= restoreOffset) {
+                restorer.setRestoredOffset(restorer.checkpoint());
+                iter.remove();
+                completedRestorers.add(topicPartition);
+            } else if (restoreOffset == 0) {
+                restorer.setRestoredOffset(0);
+                iter.remove();
+                completedRestorers.add(topicPartition);
+            } else {
+                restorer.setEndingOffset(restoreOffset);
+            }
+            needsInitializing.remove(topicPartition);
         }
 
         // set up restorer for those initializable
         if (!initializable.isEmpty()) {
-            startRestoration(initializable);
+            startRestoration(initializable, active);
         }
     }
 
-    private void startRestoration(final Map<TopicPartition, StateRestorer> initialized) {
-        log.debug("Start restoring state stores from changelog topics {}", initialized.keySet());
+    private void startRestoration(final Set<TopicPartition> initialized,
+                                  final RestoringTasks active) {
+        log.debug("Start restoring state stores from changelog topics {}", initialized);
 
-        final Set<TopicPartition> assignment = new HashSet<>(consumer.assignment());
-        assignment.addAll(initialized.keySet());
-        consumer.assign(assignment);
+        final Set<TopicPartition> assignment = new HashSet<>(restoreConsumer.assignment());
+        assignment.addAll(initialized);
+        restoreConsumer.assign(assignment);
 
         final List<StateRestorer> needsPositionUpdate = new ArrayList<>();
-        for (final StateRestorer restorer : initialized.values()) {
+
+        for (final TopicPartition partition : initialized) {
+            final StateRestorer restorer = stateRestorers.get(partition);
             if (restorer.checkpoint() != StateRestorer.NO_CHECKPOINT) {
-                consumer.seek(restorer.partition(), restorer.checkpoint());
-                logRestoreOffsets(restorer.partition(),
+                log.trace("Found checkpoint {} from changelog {} for store {}.", restorer.checkpoint(), partition, restorer.storeName());
+
+                restoreConsumer.seek(partition, restorer.checkpoint());
+                logRestoreOffsets(partition,
                         restorer.checkpoint(),
-                        endOffsets.get(restorer.partition()));
-                restorer.setStartingOffset(consumer.position(restorer.partition()));
+                        restoreToOffsets.get(partition));
+                restorer.setStartingOffset(restoreConsumer.position(partition));
                 restorer.restoreStarted();
             } else {
-                consumer.seekToBeginning(Collections.singletonList(restorer.partition()));
+                log.trace("Did not find checkpoint from changelog {} for store {}, rewinding to beginning.", partition, restorer.storeName());
+
+                restoreConsumer.seekToBeginning(Collections.singletonList(partition));
                 needsPositionUpdate.add(restorer);
             }
         }
 
         for (final StateRestorer restorer : needsPositionUpdate) {
-            final long position = consumer.position(restorer.partition());
-            logRestoreOffsets(restorer.partition(),
-                    position,
-                    endOffsets.get(restorer.partition()));
-            restorer.setStartingOffset(position);
-            restorer.restoreStarted();
+            final TopicPartition partition = restorer.partition();
+
+            // If checkpoint does not exist it means the task was not shutdown gracefully before;
+            // and in this case if EOS is turned on we should wipe out the state and re-initialize the task
+            final StreamTask task = active.restoringTaskFor(partition);
+            if (task.isEosEnabled()) {
+                log.info("No checkpoint found for task {} state store {} changelog {} with EOS turned on. " +
+                        "Reinitializing the task and restore its state from the beginning.", task.id, restorer.storeName(), partition);
+
+                needsInitializing.remove(partition);
+                initialized.remove(partition);
+                restorer.setCheckpointOffset(restoreConsumer.position(partition));
+
+                task.reinitializeStateStoresForPartitions(Collections.singleton(partition));
+            } else {
+                log.info("Restoring task {}'s state store {} from beginning of the changelog {} ", task.id, restorer.storeName(), partition);
+
+                final long position = restoreConsumer.position(restorer.partition());
+                logRestoreOffsets(restorer.partition(),
+                        position,
+                        restoreToOffsets.get(restorer.partition()));
+                restorer.setStartingOffset(position);
+                restorer.restoreStarted();
+            }
         }
 
-        needsRestoring.putAll(initialized);
+        needsRestoring.addAll(initialized);
     }
 
     private void logRestoreOffsets(final TopicPartition partition,
@@ -194,16 +252,9 @@ public class StoreChangelogReader implements ChangelogReader {
                   endOffset);
     }
 
-    private Collection<TopicPartition> completed() {
-        final Set<TopicPartition> completed = new HashSet<>(stateRestorers.keySet());
-        completed.removeAll(needsRestoring.keySet());
-        log.debug("completed partitions {}", completed);
-        return completed;
-    }
-
     private void refreshChangelogInfo() {
         try {
-            partitionInfo.putAll(consumer.listTopics());
+            partitionInfo.putAll(restoreConsumer.listTopics());
         } catch (final TimeoutException e) {
             log.debug("Could not fetch topic metadata within the timeout, will retry in the next run loop");
         }
@@ -222,68 +273,74 @@ public class StoreChangelogReader implements ChangelogReader {
     }
 
     @Override
-    public void reset() {
+    public void remove(final List<TopicPartition> revokedPartitions) {
+        for (final TopicPartition partition : revokedPartitions) {
+            partitionInfo.remove(partition.topic());
+            stateRestorers.remove(partition);
+            needsRestoring.remove(partition);
+            restoreToOffsets.remove(partition);
+            needsInitializing.remove(partition);
+            completedRestorers.remove(partition);
+        }
+    }
+
+    @Override
+    public void clear() {
         partitionInfo.clear();
         stateRestorers.clear();
         needsRestoring.clear();
-        endOffsets.clear();
+        restoreToOffsets.clear();
         needsInitializing.clear();
-    }
-
-    private void restorePartition(final ConsumerRecords<byte[], byte[]> allRecords,
-                                  final TopicPartition topicPartition) {
-        final StateRestorer restorer = stateRestorers.get(topicPartition);
-        final Long endOffset = endOffsets.get(topicPartition);
-        final long pos = processNext(allRecords.records(topicPartition), restorer, endOffset);
-        restorer.setRestoredOffset(pos);
-        if (restorer.hasCompleted(pos, endOffset)) {
-            if (pos > endOffset + 1) {
-                throw new IllegalStateException(
-                        String.format("Log end offset of %s should not change while restoring: old end offset %d, current offset %d",
-                                      topicPartition,
-                                      endOffset,
-                                      pos));
-            }
-
-            log.debug("Completed restoring state from changelog {} with {} records ranging from offset {} to {}",
-                      topicPartition,
-                      restorer.restoredNumRecords(),
-                      restorer.startingOffset(),
-                      restorer.restoredOffset());
-
-            restorer.restoreDone();
-            needsRestoring.remove(topicPartition);
-        }
+        completedRestorers.clear();
     }
 
     private long processNext(final List<ConsumerRecord<byte[], byte[]>> records,
                              final StateRestorer restorer,
                              final Long endOffset) {
-        final List<KeyValue<byte[], byte[]>> restoreRecords = new ArrayList<>();
+        final List<ConsumerRecord<byte[], byte[]>> restoreRecords = new ArrayList<>();
         long nextPosition = -1;
-
+        final int numberRecords = records.size();
+        int numberRestored = 0;
+        long lastRestoredOffset = -1;
         for (final ConsumerRecord<byte[], byte[]> record : records) {
             final long offset = record.offset();
             if (restorer.hasCompleted(offset, endOffset)) {
                 nextPosition = record.offset();
                 break;
             }
+            lastRestoredOffset = offset;
+            numberRestored++;
             if (record.key() != null) {
-                restoreRecords.add(KeyValue.pair(record.key(), record.value()));
+                restoreRecords.add(record);
             }
         }
 
-        if (nextPosition == -1) {
-            nextPosition = consumer.position(restorer.partition());
+
+        // if we have changelog topic then we should have restored all records in the list
+        // otherwise if we did not fully restore to that point we need to set nextPosition
+        // to the position of the restoreConsumer and we'll cause a TaskMigratedException exception
+        if (nextPosition == -1 || (restorer.offsetLimit() == Long.MAX_VALUE && numberRecords != numberRestored)) {
+            nextPosition = restoreConsumer.position(restorer.partition());
         }
 
         if (!restoreRecords.isEmpty()) {
             restorer.restore(restoreRecords);
-            restorer.restoreBatchCompleted(nextPosition, records.size());
+            restorer.restoreBatchCompleted(lastRestoredOffset, records.size());
 
+            log.trace("Restored from {} to {} with {} records, ending offset is {}, next starting position is {}",
+                    restorer.partition(), restorer.storeName(), records.size(), lastRestoredOffset, nextPosition);
         }
 
         return nextPosition;
+    }
+
+    private boolean checkForCompletedRestoration() {
+        if (needsRestoring.isEmpty()) {
+            log.info("Finished restoring all active tasks");
+            restoreConsumer.unsubscribe();
+            return true;
+        }
+        return false;
     }
 
     private boolean hasPartition(final TopicPartition topicPartition) {

@@ -16,51 +16,73 @@
  */
 package org.apache.kafka.common.requests;
 
+import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.network.NetworkSend;
 import org.apache.kafka.common.network.Send;
 import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.protocol.types.Struct;
 
 import java.nio.ByteBuffer;
+import java.util.Map;
 
 public abstract class AbstractRequest extends AbstractRequestResponse {
 
     public static abstract class Builder<T extends AbstractRequest> {
         private final ApiKeys apiKey;
-        private final Short desiredVersion;
+        private final short oldestAllowedVersion;
+        private final short latestAllowedVersion;
 
+        /**
+         * Construct a new builder which allows any supported version
+         */
         public Builder(ApiKeys apiKey) {
-            this(apiKey, null);
+            this(apiKey, apiKey.oldestVersion(), apiKey.latestVersion());
         }
 
-        public Builder(ApiKeys apiKey, Short desiredVersion) {
+        /**
+         * Construct a new builder which allows only a specific version
+         */
+        public Builder(ApiKeys apiKey, short allowedVersion) {
+            this(apiKey, allowedVersion, allowedVersion);
+        }
+
+        /**
+         * Construct a new builder which allows an inclusive range of versions
+         */
+        public Builder(ApiKeys apiKey, short oldestAllowedVersion, short latestAllowedVersion) {
             this.apiKey = apiKey;
-            this.desiredVersion = desiredVersion;
+            this.oldestAllowedVersion = oldestAllowedVersion;
+            this.latestAllowedVersion = latestAllowedVersion;
         }
 
         public ApiKeys apiKey() {
             return apiKey;
         }
 
-        public short desiredOrLatestVersion() {
-            return desiredVersion == null ? apiKey.latestVersion() : desiredVersion;
+        public short oldestAllowedVersion() {
+            return oldestAllowedVersion;
         }
 
-        public Short desiredVersion() {
-            return desiredVersion;
+        public short latestAllowedVersion() {
+            return latestAllowedVersion;
         }
 
         public T build() {
-            return build(desiredOrLatestVersion());
+            return build(latestAllowedVersion());
         }
 
         public abstract T build(short version);
     }
 
     private final short version;
+    public final ApiKeys api;
 
-    public AbstractRequest(short version) {
+    public AbstractRequest(ApiKeys api, short version) {
+        if (!api.isVersionSupported(version))
+            throw new UnsupportedVersionException("The " + api + " protocol does not support version " + version);
         this.version = version;
+        this.api = api;
     }
 
     /**
@@ -103,6 +125,18 @@ public abstract class AbstractRequest extends AbstractRequestResponse {
      * Get an error response for a request with specified throttle time in the response if applicable
      */
     public abstract AbstractResponse getErrorResponse(int throttleTimeMs, Throwable e);
+
+    /**
+     * Get the error counts corresponding to an error response. This is overridden for requests
+     * where response may be null (e.g produce with acks=0).
+     */
+    public Map<Errors, Integer> errorCounts(Throwable e) {
+        AbstractResponse response = getErrorResponse(0, e);
+        if (response == null)
+            throw new IllegalStateException("Error counts could not be obtained for request " + this);
+        else
+            return response.errorCounts();
+    }
 
     /**
      * Factory method for getting a request object based on ApiKey ID and a version
@@ -177,14 +211,34 @@ public abstract class AbstractRequest extends AbstractRequestResponse {
                 return new DescribeConfigsRequest(struct, apiVersion);
             case ALTER_CONFIGS:
                 return new AlterConfigsRequest(struct, apiVersion);
-            case ALTER_REPLICA_DIR:
-                return new AlterReplicaDirRequest(struct, apiVersion);
+            case ALTER_REPLICA_LOG_DIRS:
+                return new AlterReplicaLogDirsRequest(struct, apiVersion);
             case DESCRIBE_LOG_DIRS:
                 return new DescribeLogDirsRequest(struct, apiVersion);
             case SASL_AUTHENTICATE:
                 return new SaslAuthenticateRequest(struct, apiVersion);
             case CREATE_PARTITIONS:
                 return new CreatePartitionsRequest(struct, apiVersion);
+            case CREATE_DELEGATION_TOKEN:
+                return new CreateDelegationTokenRequest(struct, apiVersion);
+            case RENEW_DELEGATION_TOKEN:
+                return new RenewDelegationTokenRequest(struct, apiVersion);
+            case EXPIRE_DELEGATION_TOKEN:
+                return new ExpireDelegationTokenRequest(struct, apiVersion);
+            case DESCRIBE_DELEGATION_TOKEN:
+                return new DescribeDelegationTokenRequest(struct, apiVersion);
+            case DELETE_GROUPS:
+                return new DeleteGroupsRequest(struct, apiVersion);
+            case ELECT_LEADERS:
+                return new ElectLeadersRequest(struct, apiVersion);
+            case INCREMENTAL_ALTER_CONFIGS:
+                return new IncrementalAlterConfigsRequest(struct, apiVersion);
+            case ALTER_PARTITION_REASSIGNMENTS:
+                return new AlterPartitionReassignmentsRequest(struct, apiVersion);
+            case LIST_PARTITION_REASSIGNMENTS:
+                return new ListPartitionReassignmentsRequest(struct, apiVersion);
+            case OFFSET_DELETE:
+                return new OffsetDeleteRequest(struct, apiVersion);
             default:
                 throw new AssertionError(String.format("ApiKey %s is not currently handled in `parseRequest`, the " +
                         "code should be updated to do so.", apiKey));

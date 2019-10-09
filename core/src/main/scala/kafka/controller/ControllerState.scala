@@ -1,4 +1,4 @@
-/*
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements. See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -58,7 +58,7 @@ object ControllerState {
     def value = 4
   }
 
-  case object PartitionReassignment extends ControllerState {
+  case object AlterPartitionReassignment extends ControllerState {
     def value = 5
   }
 
@@ -86,7 +86,23 @@ object ControllerState {
     def value = 11
   }
 
+  case object ControllerShutdown extends ControllerState {
+    def value = 12
+  }
+
+  case object UncleanLeaderElectionEnable extends ControllerState {
+    def value = 13
+  }
+
+  case object TopicUncleanLeaderElectionEnable extends ControllerState {
+    def value = 14
+  }
+
+  case object ListPartitionReassignment extends ControllerState {
+    def value = 15
+  }
+
   val values: Seq[ControllerState] = Seq(Idle, ControllerChange, BrokerChange, TopicChange, TopicDeletion,
-    PartitionReassignment, AutoLeaderBalance, ManualLeaderBalance, ControlledShutdown, IsrChange, LeaderAndIsrResponseReceived,
-    LogDirChange)
+    AlterPartitionReassignment, AutoLeaderBalance, ManualLeaderBalance, ControlledShutdown, IsrChange, LeaderAndIsrResponseReceived,
+    LogDirChange, ControllerShutdown, UncleanLeaderElectionEnable, TopicUncleanLeaderElectionEnable, ListPartitionReassignment)
 }

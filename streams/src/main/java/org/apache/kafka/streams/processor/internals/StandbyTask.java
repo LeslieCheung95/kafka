@@ -16,31 +16,36 @@
  */
 package org.apache.kafka.streams.processor.internals;
 
-import org.apache.kafka.clients.consumer.Consumer;
-import org.apache.kafka.clients.consumer.ConsumerRecord;
-import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.streams.StreamsConfig;
-import org.apache.kafka.streams.StreamsMetrics;
-import org.apache.kafka.streams.processor.TaskId;
-
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.StreamsMetrics;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
 
 /**
  * A StandbyTask
  */
 public class StandbyTask extends AbstractTask {
-
+    private boolean updateOffsetLimits;
+    private final Sensor closeTaskSensor;
+    private final Map<TopicPartition, Long> offsetLimits = new HashMap<>();
     private Map<TopicPartition, Long> checkpointedOffsets = new HashMap<>();
 
     /**
      * Create {@link StandbyTask} with its assigned partitions
      *
      * @param id             the ID of this task
-     * @param applicationId  the ID of the stream processing application
      * @param partitions     the collection of assigned {@link TopicPartition}
      * @param topology       the instance of {@link ProcessorTopology}
      * @param consumer       the instance of {@link Consumer}
@@ -49,27 +54,44 @@ public class StandbyTask extends AbstractTask {
      * @param stateDirectory the {@link StateDirectory} created by the thread
      */
     StandbyTask(final TaskId id,
-                final String applicationId,
                 final Collection<TopicPartition> partitions,
                 final ProcessorTopology topology,
                 final Consumer<byte[], byte[]> consumer,
                 final ChangelogReader changelogReader,
                 final StreamsConfig config,
-                final StreamsMetrics metrics,
+                final StreamsMetricsImpl metrics,
                 final StateDirectory stateDirectory) {
-        super(id, applicationId, partitions, topology, consumer, changelogReader, true, stateDirectory, config);
+        super(id, partitions, topology, consumer, changelogReader, true, stateDirectory, config);
 
-        // initialize the topology with its own context
-        processorContext = new StandbyContextImpl(id, applicationId, config, stateMgr, metrics);
+        closeTaskSensor = metrics
+            .threadLevelSensor(Thread.currentThread().getName(), "task-closed", Sensor.RecordingLevel.INFO);
+        processorContext = new StandbyContextImpl(id, config, stateMgr, metrics);
+
+        final Set<String> changelogTopicNames = new HashSet<>(topology.storeToChangelogTopic().values());
+        partitions.stream()
+            .filter(tp -> changelogTopicNames.contains(tp.topic()))
+            .forEach(tp -> offsetLimits.put(tp, 0L));
+        updateOffsetLimits = true;
     }
 
     @Override
-    public boolean initialize() {
-        initializeStateStores();
+    public boolean initializeStateStores() {
+        log.trace("Initializing state stores");
+        registerStateStores();
         checkpointedOffsets = Collections.unmodifiableMap(stateMgr.checkpointed());
-        processorContext.initialized();
+        processorContext.initialize();
         taskInitialized = true;
         return true;
+    }
+
+    @Override
+    public void initializeTopology() {
+        //no-op
+    }
+
+    @Override
+    public void initializeTaskTime() {
+        //no-op
     }
 
     /**
@@ -80,7 +102,7 @@ public class StandbyTask extends AbstractTask {
     @Override
     public void resume() {
         log.debug("Resuming");
-        updateOffsetLimits();
+        allowUpdateOfOffsetLimit();
     }
 
     /**
@@ -94,25 +116,13 @@ public class StandbyTask extends AbstractTask {
     public void commit() {
         log.trace("Committing");
         flushAndCheckpointState();
-        // reinitialize offset limits
-        updateOffsetLimits();
-    }
-
-    /**
-     * <pre>
-     * - flush store
-     * - checkpoint store
-     * </pre>
-     */
-    @Override
-    public void suspend() {
-        log.debug("Suspending");
-        flushAndCheckpointState();
+        allowUpdateOfOffsetLimit();
+        commitNeeded = false;
     }
 
     private void flushAndCheckpointState() {
         stateMgr.flush();
-        stateMgr.checkpoint(Collections.<TopicPartition, Long>emptyMap());
+        stateMgr.checkpoint(Collections.emptyMap());
     }
 
     /**
@@ -120,36 +130,25 @@ public class StandbyTask extends AbstractTask {
      * - {@link #commit()}
      * - close state
      * <pre>
-     * @param clean ignored by {@code StandbyTask} as it can always try to close cleanly
-     *              (ie, commit, flush, and write checkpoint file)
      * @param isZombie ignored by {@code StandbyTask} as it can never be a zombie
      */
     @Override
     public void close(final boolean clean,
                       final boolean isZombie) {
+        closeTaskSensor.record();
         if (!taskInitialized) {
             return;
         }
         log.debug("Closing");
-        boolean committedSuccessfully = false;
         try {
-            commit();
-            committedSuccessfully = true;
+            if (clean) {
+                commit();
+            }
         } finally {
-            closeStateManager(committedSuccessfully);
+            closeStateManager(true);
         }
-    }
 
-    @Override
-    public void closeSuspended(final boolean clean,
-                               final boolean isZombie,
-                               final RuntimeException e) {
-        close(clean, isZombie);
-    }
-
-    @Override
-    public boolean commitNeeded() {
-        return false;
+        taskClosed = true;
     }
 
     /**
@@ -159,32 +158,68 @@ public class StandbyTask extends AbstractTask {
      */
     public List<ConsumerRecord<byte[], byte[]>> update(final TopicPartition partition,
                                                        final List<ConsumerRecord<byte[], byte[]>> records) {
+        if (records.isEmpty()) {
+            return Collections.emptyList();
+        }
+
         log.trace("Updating standby replicas of its state store for partition [{}]", partition);
-        return stateMgr.updateStandbyStates(partition, records);
+        long limit = offsetLimits.getOrDefault(partition, Long.MAX_VALUE);
+
+        long lastOffset = -1L;
+        final List<ConsumerRecord<byte[], byte[]>> restoreRecords = new ArrayList<>(records.size());
+        final List<ConsumerRecord<byte[], byte[]>> remainingRecords = new ArrayList<>();
+
+        for (final ConsumerRecord<byte[], byte[]> record : records) {
+            // Check if we're unable to process records due to an offset limit (e.g. when our
+            // partition is both a source and a changelog). If we're limited then try to refresh
+            // the offset limit if possible.
+            if (record.offset() >= limit && updateOffsetLimits) {
+                limit = updateOffsetLimits(partition);
+            }
+
+            if (record.offset() < limit) {
+                restoreRecords.add(record);
+                lastOffset = record.offset();
+            } else {
+                remainingRecords.add(record);
+            }
+        }
+
+        if (!restoreRecords.isEmpty()) {
+            stateMgr.updateStandbyStates(partition, restoreRecords, lastOffset);
+            commitNeeded = true;
+        }
+
+        return remainingRecords;
     }
 
-    @Override
-    public int addRecords(final TopicPartition partition, final Iterable<ConsumerRecord<byte[], byte[]>> records) {
-        throw new UnsupportedOperationException("add records not supported by StandbyTasks");
-    }
-
-    public Map<TopicPartition, Long> checkpointedOffsets() {
+    Map<TopicPartition, Long> checkpointedOffsets() {
         return checkpointedOffsets;
     }
 
-    @Override
-    public boolean maybePunctuateStreamTime() {
-        throw new UnsupportedOperationException("maybePunctuateStreamTime not supported by StandbyTask");
+    private long updateOffsetLimits(final TopicPartition partition) {
+        if (!offsetLimits.containsKey(partition)) {
+            throw new IllegalArgumentException("Topic is not both a source and a changelog: " + partition);
+        }
+
+        final Map<TopicPartition, Long> newLimits = committedOffsetForPartitions(offsetLimits.keySet());
+
+        for (final Map.Entry<TopicPartition, Long> newlimit : newLimits.entrySet()) {
+            final Long previousLimit = offsetLimits.get(newlimit.getKey());
+            if (previousLimit != null && previousLimit > newlimit.getValue()) {
+                throw new IllegalStateException("Offset limit should monotonically increase, but was reduced. " +
+                    "New limit: " + newlimit.getValue() + ". Previous limit: " + previousLimit);
+            }
+
+        }
+
+        offsetLimits.putAll(newLimits);
+        updateOffsetLimits = false;
+
+        return offsetLimits.get(partition);
     }
 
-    @Override
-    public boolean maybePunctuateSystemTime() {
-        throw new UnsupportedOperationException("maybePunctuateSystemTime not supported by StandbyTask");
+    void allowUpdateOfOffsetLimit() {
+        updateOffsetLimits = true;
     }
-
-    @Override
-    public boolean process() {
-        throw new UnsupportedOperationException("process not supported by StandbyTasks");
-    }
-
 }

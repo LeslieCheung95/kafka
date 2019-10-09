@@ -16,103 +16,63 @@
  */
 package org.apache.kafka.common.requests;
 
+import org.apache.kafka.common.message.InitProducerIdResponseData;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
-import org.apache.kafka.common.protocol.types.Field;
-import org.apache.kafka.common.protocol.types.Schema;
 import org.apache.kafka.common.protocol.types.Struct;
-import org.apache.kafka.common.record.RecordBatch;
 
 import java.nio.ByteBuffer;
+import java.util.Map;
 
-import static org.apache.kafka.common.protocol.CommonFields.ERROR_CODE;
-import static org.apache.kafka.common.protocol.CommonFields.THROTTLE_TIME_MS;
-import static org.apache.kafka.common.protocol.types.Type.INT16;
-import static org.apache.kafka.common.protocol.types.Type.INT64;
-
+/**
+ * Possible error codes:
+ * - {@link Errors#NOT_COORDINATOR}
+ * - {@link Errors#COORDINATOR_NOT_AVAILABLE}
+ * - {@link Errors#COORDINATOR_LOAD_IN_PROGRESS}
+ * - {@link Errors#TRANSACTIONAL_ID_AUTHORIZATION_FAILED}
+ * - {@link Errors#CLUSTER_AUTHORIZATION_FAILED}
+ */
 public class InitProducerIdResponse extends AbstractResponse {
-    // Possible error codes:
-    //   NotCoordinator
-    //   CoordinatorNotAvailable
-    //   CoordinatorLoadInProgress
-    //   TransactionalIdAuthorizationFailed
-    //   ClusterAuthorizationFailed
+    public final InitProducerIdResponseData data;
 
-    private static final String PRODUCER_ID_KEY_NAME = "producer_id";
-    private static final String EPOCH_KEY_NAME = "producer_epoch";
-
-    private static final Schema INIT_PRODUCER_ID_RESPONSE_V0 = new Schema(
-            THROTTLE_TIME_MS,
-            ERROR_CODE,
-            new Field(PRODUCER_ID_KEY_NAME, INT64, "The producer id for the input transactional id. If the input " +
-                    "id was empty, then this is used only for ensuring idempotence of messages."),
-            new Field(EPOCH_KEY_NAME, INT16, "The epoch for the producer id. Will always be 0 if no transactional " +
-                    "id was specified in the request."));
-
-    public static Schema[] schemaVersions() {
-        return new Schema[]{INIT_PRODUCER_ID_RESPONSE_V0};
+    public InitProducerIdResponse(InitProducerIdResponseData data) {
+        this.data = data;
     }
 
-    private final int throttleTimeMs;
-    private final Errors error;
-    private final long producerId;
-    private final short epoch;
-
-    public InitProducerIdResponse(int throttleTimeMs, Errors error, long producerId, short epoch) {
-        this.throttleTimeMs = throttleTimeMs;
-        this.error = error;
-        this.producerId = producerId;
-        this.epoch = epoch;
+    public InitProducerIdResponse(Struct struct, short version) {
+        this.data = new InitProducerIdResponseData(struct, version);
     }
 
-    public InitProducerIdResponse(Struct struct) {
-        this.throttleTimeMs = struct.get(THROTTLE_TIME_MS);
-        this.error = Errors.forCode(struct.get(ERROR_CODE));
-        this.producerId = struct.getLong(PRODUCER_ID_KEY_NAME);
-        this.epoch = struct.getShort(EPOCH_KEY_NAME);
-    }
-
-    public InitProducerIdResponse(int throttleTimeMs, Errors errors) {
-        this(throttleTimeMs, errors, RecordBatch.NO_PRODUCER_ID, (short) 0);
-    }
-
+    @Override
     public int throttleTimeMs() {
-        return throttleTimeMs;
+        return data.throttleTimeMs();
     }
 
-    public long producerId() {
-        return producerId;
-    }
-
-    public Errors error() {
-        return error;
-    }
-
-    public short epoch() {
-        return epoch;
+    @Override
+    public Map<Errors, Integer> errorCounts() {
+        return errorCounts(Errors.forCode(data.errorCode()));
     }
 
     @Override
     protected Struct toStruct(short version) {
-        Struct struct = new Struct(ApiKeys.INIT_PRODUCER_ID.responseSchema(version));
-        struct.set(THROTTLE_TIME_MS, throttleTimeMs);
-        struct.set(PRODUCER_ID_KEY_NAME, producerId);
-        struct.set(EPOCH_KEY_NAME, epoch);
-        struct.set(ERROR_CODE, error.code());
-        return struct;
+        return data.toStruct(version);
     }
 
     public static InitProducerIdResponse parse(ByteBuffer buffer, short version) {
-        return new InitProducerIdResponse(ApiKeys.INIT_PRODUCER_ID.parseResponse(version, buffer));
+        return new InitProducerIdResponse(ApiKeys.INIT_PRODUCER_ID.parseResponse(version, buffer), version);
     }
 
     @Override
     public String toString() {
-        return "InitProducerIdResponse(" +
-                "error=" + error +
-                ", producerId=" + producerId +
-                ", producerEpoch=" + epoch +
-                ", throttleTimeMs=" + throttleTimeMs +
-                ')';
+        return data.toString();
+    }
+
+    public Errors error() {
+        return Errors.forCode(data.errorCode());
+    }
+
+    @Override
+    public boolean shouldClientThrottle(short version) {
+        return version >= 1;
     }
 }

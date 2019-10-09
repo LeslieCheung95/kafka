@@ -118,7 +118,7 @@ public class WriteTxnMarkersResponse extends AbstractResponse {
             responseStruct.set(PRODUCER_ID_KEY_NAME, responseEntry.getKey());
 
             Map<TopicPartition, Errors> partitionAndErrors = responseEntry.getValue();
-            Map<String, Map<Integer, Errors>> mappedPartitions = CollectionUtils.groupDataByTopic(partitionAndErrors);
+            Map<String, Map<Integer, Errors>> mappedPartitions = CollectionUtils.groupPartitionDataByTopic(partitionAndErrors);
             Object[] partitionsArray = new Object[mappedPartitions.size()];
             int i = 0;
             for (Map.Entry<String, Map<Integer, Errors>> topicAndPartitions : mappedPartitions.entrySet()) {
@@ -150,8 +150,17 @@ public class WriteTxnMarkersResponse extends AbstractResponse {
         return errors.get(producerId);
     }
 
+    @Override
+    public Map<Errors, Integer> errorCounts() {
+        Map<Errors, Integer> errorCounts = new HashMap<>();
+        for (Map<TopicPartition, Errors> allErrors : errors.values()) {
+            for (Errors error : allErrors.values())
+                updateErrorCounts(errorCounts, error);
+        }
+        return errorCounts;
+    }
+
     public static WriteTxnMarkersResponse parse(ByteBuffer buffer, short version) {
         return new WriteTxnMarkersResponse(ApiKeys.WRITE_TXN_MARKERS.parseResponse(version, buffer));
     }
-
 }

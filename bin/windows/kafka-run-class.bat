@@ -27,7 +27,7 @@ set BASE_DIR=%CD%
 popd
 
 IF ["%SCALA_VERSION%"] EQU [""] (
-  set SCALA_VERSION=2.11.11
+  set SCALA_VERSION=2.12.10
 )
 
 IF ["%SCALA_BINARY_VERSION%"] EQU [""] (
@@ -111,7 +111,7 @@ IF ["%JMX_PORT%"] NEQ [""] (
 
 rem Log directory to use
 IF ["%LOG_DIR%"] EQU [""] (
-    set LOG_DIR="%BASE_DIR~%/logs"
+    set LOG_DIR=%BASE_DIR%/logs
 )
 
 rem Log4j settings
@@ -168,7 +168,7 @@ IF ["%KAFKA_HEAP_OPTS%"] EQU [""] (
 
 rem JVM performance options
 IF ["%KAFKA_JVM_PERFORMANCE_OPTS%"] EQU [""] (
-	set KAFKA_JVM_PERFORMANCE_OPTS=-server -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35 -XX:ExplicitGCInvokesConcurrent -Djava.awt.headless=true
+	set KAFKA_JVM_PERFORMANCE_OPTS=-server -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35 -XX:+ExplicitGCInvokesConcurrent -Djava.awt.headless=true
 )
 
 IF not defined CLASSPATH (
@@ -176,7 +176,7 @@ IF not defined CLASSPATH (
 	EXIT /B 2
 )
 
-set COMMAND=%JAVA% %KAFKA_HEAP_OPTS% %KAFKA_JVM_PERFORMANCE_OPTS% %KAFKA_JMX_OPTS% %KAFKA_LOG4J_OPTS% -cp %CLASSPATH% %KAFKA_OPTS% %*
+set COMMAND=%JAVA% %KAFKA_HEAP_OPTS% %KAFKA_JVM_PERFORMANCE_OPTS% %KAFKA_JMX_OPTS% %KAFKA_LOG4J_OPTS% -cp "%CLASSPATH%" %KAFKA_OPTS% %*
 rem echo.
 rem echo %COMMAND%
 rem echo.

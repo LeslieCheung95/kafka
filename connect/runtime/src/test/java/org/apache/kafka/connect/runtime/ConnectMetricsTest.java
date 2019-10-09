@@ -16,20 +16,28 @@
  */
 package org.apache.kafka.connect.runtime;
 
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.stats.Avg;
+import org.apache.kafka.common.metrics.stats.Max;
+import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.connect.runtime.ConnectMetrics.MetricGroup;
-import org.apache.kafka.connect.util.MockTime;
+import org.apache.kafka.connect.runtime.ConnectMetrics.MetricGroupId;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertSame;
 
+@SuppressWarnings("deprecation")
 public class ConnectMetricsTest {
 
     private static final Map<String, String> DEFAULT_WORKER_CONFIG = new HashMap<>();
@@ -50,31 +58,8 @@ public class ConnectMetricsTest {
 
     @After
     public void tearDown() {
-        if (metrics != null) metrics.stop();
-    }
-
-    @Test
-    public void testValidatingNameWithAllValidCharacters() {
-        String name = "abcdefghijklmnopqrstuvwxyz_ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789";
-        assertEquals(name, ConnectMetrics.makeValidName(name));
-    }
-
-    @Test
-    public void testValidatingEmptyName() {
-        String name = "";
-        assertSame(name, ConnectMetrics.makeValidName(name));
-    }
-
-    @Test(expected = NullPointerException.class)
-    public void testValidatingNullName() {
-        ConnectMetrics.makeValidName(null);
-    }
-
-    @Test
-    public void testValidatingNameWithInvalidCharacters() {
-        assertEquals("a-b-c-d-e-f-g-h-i-j-k", ConnectMetrics.makeValidName("a:b;c/d\\e,f*.--..;;g?h[i]j=k"));
-        assertEquals("-a-b-c-d-e-f-g-h-", ConnectMetrics.makeValidName(":a:b;c/d\\e,f*g?[]=h:"));
-        assertEquals("a-f-h", ConnectMetrics.makeValidName("a:;/\\,f*?h"));
+        if (metrics != null)
+            metrics.stop();
     }
 
     @Test
@@ -83,53 +68,29 @@ public class ConnectMetricsTest {
     }
 
     @Test
-    public void testCreatingTagsWithNonNullWorkerId() {
-        Map<String, String> tags = ConnectMetrics.tags("name", "k1", "v1", "k2", "v2");
+    public void testCreatingTags() {
+        Map<String, String> tags = ConnectMetrics.tags("k1", "v1", "k2", "v2");
         assertEquals("v1", tags.get("k1"));
         assertEquals("v2", tags.get("k2"));
-        assertEquals("name", tags.get(ConnectMetrics.WORKER_ID_TAG_NAME));
-    }
-
-    @Test
-    public void testCreatingTagsWithNullWorkerId() {
-        Map<String, String> tags = ConnectMetrics.tags(null, "k1", "v1", "k2", "v2");
-        assertEquals("v1", tags.get("k1"));
-        assertEquals("v2", tags.get("k2"));
-        assertEquals(null, tags.get(ConnectMetrics.WORKER_ID_TAG_NAME));
-    }
-
-    @Test
-    public void testCreatingTagsWithEmptyWorkerId() {
-        Map<String, String> tags = ConnectMetrics.tags("", "k1", "v1", "k2", "v2");
-        assertEquals("v1", tags.get("k1"));
-        assertEquals("v2", tags.get("k2"));
-        assertEquals(null, tags.get(ConnectMetrics.WORKER_ID_TAG_NAME));
+        assertEquals(2, tags.size());
     }
 
     @Test(expected = IllegalArgumentException.class)
     public void testCreatingTagsWithOddNumberOfTags() {
-        ConnectMetrics.tags("name", "k1", "v1", "k2", "v2", "extra");
+        ConnectMetrics.tags("k1", "v1", "k2", "v2", "extra");
     }
 
     @Test(expected = IllegalArgumentException.class)
     public void testGettingGroupWithOddNumberOfTags() {
-        metrics.group("name", false, "k1", "v1", "k2", "v2", "extra");
+        metrics.group("name", "k1", "v1", "k2", "v2", "extra");
     }
 
     @Test
     public void testGettingGroupWithTags() {
-        MetricGroup group1 = metrics.group("name", false, "k1", "v1", "k2", "v2");
+        MetricGroup group1 = metrics.group("name", "k1", "v1", "k2", "v2");
         assertEquals("v1", group1.tags().get("k1"));
         assertEquals("v2", group1.tags().get("k2"));
-        assertEquals(null, group1.tags().get(ConnectMetrics.WORKER_ID_TAG_NAME));
-    }
-
-    @Test
-    public void testGettingGroupWithWorkerIdAndTags() {
-        MetricGroup group1 = metrics.group("name", true, "k1", "v1", "k2", "v2");
-        assertEquals("v1", group1.tags().get("k1"));
-        assertEquals("v2", group1.tags().get("k2"));
-        assertEquals(metrics.workerId(), group1.tags().get(ConnectMetrics.WORKER_ID_TAG_NAME));
+        assertEquals(2, group1.tags().size());
     }
 
     @Test
@@ -141,6 +102,80 @@ public class ConnectMetricsTest {
         MetricGroup group3 = metrics.group("other");
         assertNotNull(group3);
         assertNotSame(group1, group3);
+
+        // Now with tags
+        MetricGroup group4 = metrics.group("name", "k1", "v1");
+        assertNotNull(group4);
+        assertNotSame(group1, group4);
+        assertNotSame(group2, group4);
+        assertNotSame(group3, group4);
+        MetricGroup group5 = metrics.group("name", "k1", "v1");
+        assertSame(group4, group5);
     }
 
+    @Test
+    public void testMetricGroupIdIdentity() {
+        MetricGroupId id1 = metrics.groupId("name", "k1", "v1");
+        MetricGroupId id2 = metrics.groupId("name", "k1", "v1");
+        MetricGroupId id3 = metrics.groupId("name", "k1", "v1", "k2", "v2");
+
+        assertEquals(id1.hashCode(), id2.hashCode());
+        assertEquals(id1, id2);
+        assertEquals(id1.toString(), id2.toString());
+        assertEquals(id1.groupName(), id2.groupName());
+        assertEquals(id1.tags(), id2.tags());
+        assertNotNull(id1.tags());
+
+        assertNotEquals(id1, id3);
+    }
+
+    @Test
+    public void testMetricGroupIdWithoutTags() {
+        MetricGroupId id1 = metrics.groupId("name");
+        MetricGroupId id2 = metrics.groupId("name");
+
+        assertEquals(id1.hashCode(), id2.hashCode());
+        assertEquals(id1, id2);
+        assertEquals(id1.toString(), id2.toString());
+        assertEquals(id1.groupName(), id2.groupName());
+        assertEquals(id1.tags(), id2.tags());
+        assertNotNull(id1.tags());
+        assertNotNull(id2.tags());
+    }
+
+    @Test
+    public void testRecreateWithClose() {
+        final Sensor originalSensor = addToGroup(metrics, false);
+        final Sensor recreatedSensor = addToGroup(metrics, true);
+        // because we closed the metricGroup, we get a brand-new sensor
+        assertNotSame(originalSensor, recreatedSensor);
+    }
+
+    @Test
+    public void testRecreateWithoutClose() {
+        final Sensor originalSensor = addToGroup(metrics, false);
+        final Sensor recreatedSensor = addToGroup(metrics, false);
+        // since we didn't close the group, the second addToGroup is idempotent
+        assertSame(originalSensor, recreatedSensor);
+    }
+
+    private Sensor addToGroup(ConnectMetrics connectMetrics, boolean shouldClose) {
+        ConnectMetricsRegistry registry = connectMetrics.registry();
+        ConnectMetrics.MetricGroup metricGroup = connectMetrics.group(registry.taskGroupName(),
+                registry.connectorTagName(), "conn_name");
+
+        if (shouldClose) {
+            metricGroup.close();
+        }
+
+        Sensor sensor = metricGroup.sensor("my_sensor");
+        sensor.add(metricName("x1"), new Max());
+        sensor.add(metricName("y2"), new Avg());
+
+        return sensor;
+    }
+
+    static MetricName metricName(String name) {
+        return new MetricName(name, "test_group", "metrics for testing", Collections.<String, String>emptyMap());
+    }
 }

@@ -16,12 +16,18 @@
  */
 package org.apache.kafka.streams.state.internals;
 
+import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.errors.InvalidStateStoreException;
+import org.apache.kafka.streams.processor.internals.ProcessorStateManager;
 import org.apache.kafka.streams.state.KeyValueIterator;
 import org.apache.kafka.streams.state.KeyValueStore;
 import org.apache.kafka.streams.state.QueryableStoreTypes;
+import org.apache.kafka.streams.state.StateSerdes;
+import org.apache.kafka.streams.state.Stores;
+import org.apache.kafka.test.InternalMockProcessorContext;
 import org.apache.kafka.test.NoOpReadOnlyStore;
+import org.apache.kafka.test.NoOpRecordCollector;
 import org.apache.kafka.test.StateStoreProviderStub;
 import org.junit.Before;
 import org.junit.Test;
@@ -40,11 +46,11 @@ import static org.junit.Assert.fail;
 public class CompositeReadOnlyKeyValueStoreTest {
 
     private final String storeName = "my-store";
+    private final String storeNameA = "my-storeA";
     private StateStoreProviderStub stubProviderTwo;
     private KeyValueStore<String, String> stubOneUnderlying;
+    private KeyValueStore<String, String> otherUnderlyingStore;
     private CompositeReadOnlyKeyValueStore<String, String> theStore;
-    private KeyValueStore<String, String>
-        otherUnderlyingStore;
 
     @Before
     public void before() {
@@ -63,7 +69,16 @@ public class CompositeReadOnlyKeyValueStoreTest {
     }
 
     private KeyValueStore<String, String> newStoreInstance() {
-        return StateStoreTestUtils.newKeyValueStore(storeName, "app-id", String.class, String.class);
+        final KeyValueStore<String, String> store = Stores.keyValueStoreBuilder(Stores.inMemoryKeyValueStore(storeName),
+                Serdes.String(),
+                Serdes.String())
+                .build();
+
+        store.init(new InternalMockProcessorContext(new StateSerdes<>(ProcessorStateManager.storeChangelogTopic("appId", storeName), Serdes.String(), Serdes.String()),
+                                                    new NoOpRecordCollector()),
+                store);
+
+        return store;
     }
 
     @Test
@@ -101,43 +116,43 @@ public class CompositeReadOnlyKeyValueStoreTest {
     @Test
     public void shouldThrowNoSuchElementExceptionWhileNext() {
         stubOneUnderlying.put("a", "1");
-        KeyValueIterator<String, String> keyValueIterator = theStore.range("a", "b");
+        final KeyValueIterator<String, String> keyValueIterator = theStore.range("a", "b");
         keyValueIterator.next();
         try {
             keyValueIterator.next();
             fail("Should have thrown NoSuchElementException with next()");
-        } catch (NoSuchElementException e) { }
+        } catch (final NoSuchElementException e) { }
     }
 
     @Test
     public void shouldThrowNoSuchElementExceptionWhilePeekNext() {
         stubOneUnderlying.put("a", "1");
-        KeyValueIterator<String, String> keyValueIterator = theStore.range("a", "b");
+        final KeyValueIterator<String, String> keyValueIterator = theStore.range("a", "b");
         keyValueIterator.next();
         try {
             keyValueIterator.peekNextKey();
             fail("Should have thrown NoSuchElementException with peekNextKey()");
-        } catch (NoSuchElementException e) { }
+        } catch (final NoSuchElementException e) { }
     }
 
     @Test
     public void shouldThrowUnsupportedOperationExceptionWhileRemove() {
-        KeyValueIterator<String, String> keyValueIterator = theStore.all();
+        final KeyValueIterator<String, String> keyValueIterator = theStore.all();
         try {
             keyValueIterator.remove();
             fail("Should have thrown UnsupportedOperationException");
-        } catch (UnsupportedOperationException e) { }
+        } catch (final UnsupportedOperationException e) { }
     }
 
     @Test
     public void shouldThrowUnsupportedOperationExceptionWhileRange() {
         stubOneUnderlying.put("a", "1");
         stubOneUnderlying.put("b", "1");
-        KeyValueIterator<String, String> keyValueIterator = theStore.range("a", "b");
+        final KeyValueIterator<String, String> keyValueIterator = theStore.range("a", "b");
         try {
             keyValueIterator.remove();
             fail("Should have thrown UnsupportedOperationException");
-        } catch (UnsupportedOperationException e) { }
+        } catch (final UnsupportedOperationException e) { }
     }
 
     @Test
@@ -254,6 +269,24 @@ public class CompositeReadOnlyKeyValueStoreTest {
         });
 
         stubOneUnderlying.put("overflow", "me");
+        assertEquals(Long.MAX_VALUE, theStore.approximateNumEntries());
+    }
+
+    @Test
+    public void shouldReturnLongMaxValueOnUnderflow() {
+        stubProviderTwo.addStore(storeName, new NoOpReadOnlyStore<Object, Object>() {
+            @Override
+            public long approximateNumEntries() {
+                return Long.MAX_VALUE;
+            }
+        });
+        stubProviderTwo.addStore(storeNameA, new NoOpReadOnlyStore<Object, Object>() {
+            @Override
+            public long approximateNumEntries() {
+                return Long.MAX_VALUE;
+            }
+        });
+
         assertEquals(Long.MAX_VALUE, theStore.approximateNumEntries());
     }
 

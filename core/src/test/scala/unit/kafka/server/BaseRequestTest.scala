@@ -22,32 +22,30 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.Properties
 
-import kafka.integration.KafkaServerTestHarness
+import scala.collection.Seq
+
+import kafka.api.IntegrationTestHarness
 import kafka.network.SocketServer
-import kafka.utils._
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.protocol.types.Struct
-import org.apache.kafka.common.protocol.{ApiKeys, SecurityProtocol}
+import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.requests.{AbstractRequest, AbstractRequestResponse, RequestHeader, ResponseHeader}
+import org.apache.kafka.common.security.auth.SecurityProtocol
 
-abstract class BaseRequestTest extends KafkaServerTestHarness {
+abstract class BaseRequestTest extends IntegrationTestHarness {
   private var correlationId = 0
 
   // If required, set number of brokers
-  protected def numBrokers: Int = 3
-
-  protected def logDirCount: Int = 1
+  override def brokerCount: Int = 3
 
   // If required, override properties by mutating the passed Properties object
-  protected def propertyOverrides(properties: Properties) {}
+  protected def brokerPropertyOverrides(properties: Properties): Unit = {}
 
-  def generateConfigs = {
-    val props = TestUtils.createBrokerConfigs(numBrokers, zkConnect,
-      enableControlledShutdown = false, enableDeleteTopic = true,
-      interBrokerSecurityProtocol = Some(securityProtocol),
-      trustStoreFile = trustStoreFile, saslProperties = serverSaslProperties, logDirCount = logDirCount)
-    props.foreach(propertyOverrides)
-    props.map(KafkaConfig.fromProps)
+  override def modifyConfigs(props: Seq[Properties]): Unit = {
+    props.foreach { p =>
+      p.put(KafkaConfig.ControlledShutdownEnableProp, "false")
+      brokerPropertyOverrides(p)
+    }
   }
 
   def anySocketServer = {
@@ -79,7 +77,7 @@ abstract class BaseRequestTest extends KafkaServerTestHarness {
     new Socket("localhost", s.boundPort(ListenerName.forSecurityProtocol(protocol)))
   }
 
-  private def sendRequest(socket: Socket, request: Array[Byte]) {
+  private def sendRequest(socket: Socket, request: Array[Byte]): Unit = {
     val outgoing = new DataOutputStream(socket.getOutputStream)
     outgoing.writeInt(request.length)
     outgoing.write(request)
@@ -109,7 +107,7 @@ abstract class BaseRequestTest extends KafkaServerTestHarness {
                      apiVersion: Option[Short] = None,
                      protocol: SecurityProtocol = SecurityProtocol.PLAINTEXT): ByteBuffer = {
     val socket = connect(destination, protocol)
-    try send(request, apiKey, socket, apiVersion)
+    try sendAndReceive(request, apiKey, socket, apiVersion)
     finally socket.close()
   }
 
@@ -122,36 +120,65 @@ abstract class BaseRequestTest extends KafkaServerTestHarness {
                            destination: SocketServer = anySocketServer,
                            protocol: SecurityProtocol = SecurityProtocol.PLAINTEXT): ByteBuffer = {
     val socket = connect(destination, protocol)
-    try sendStruct(requestStruct, apiKey, socket, apiVersion)
+    try sendStructAndReceive(requestStruct, apiKey, socket, apiVersion)
     finally socket.close()
+  }
+
+  /**
+    * Serializes and sends the request to the given api.
+    */
+  def send(request: AbstractRequest, apiKey: ApiKeys, socket: Socket, apiVersion: Short): Unit = {
+    val header = nextRequestHeader(apiKey, apiVersion)
+    val serializedBytes = request.serialize(header).array
+    sendRequest(socket, serializedBytes)
+  }
+
+  /**
+   * Receive response and return a ByteBuffer containing response without the header
+   */
+  def receive(socket: Socket, responseHeaderVersion: Short): ByteBuffer = {
+    val response = receiveResponse(socket)
+    skipResponseHeader(response, responseHeaderVersion)
   }
 
   /**
     * Serializes and sends the request to the given api.
     * A ByteBuffer containing the response is returned.
     */
-  def send(request: AbstractRequest, apiKey: ApiKeys, socket: Socket, apiVersion: Option[Short] = None): ByteBuffer = {
-    val header = nextRequestHeader(apiKey, apiVersion.getOrElse(request.version))
-    val serializedBytes = request.serialize(header).array
-    val response = requestAndReceive(socket, serializedBytes)
-    skipResponseHeader(response)
+  def sendAndReceive(request: AbstractRequest, apiKey: ApiKeys, socket: Socket, apiVersion: Option[Short] = None): ByteBuffer = {
+    val version = apiVersion.getOrElse(request.version)
+    send(request, apiKey, socket, version)
+    val response = receiveResponse(socket)
+    skipResponseHeader(response, apiKey.responseHeaderVersion(version))
   }
 
+  /**
+   * Sends a request built by the builder, waits for the response and parses it 
+   */
+  def requestResponse(socket: Socket, clientId: String, correlationId: Int, requestBuilder: AbstractRequest.Builder[_ <: AbstractRequest]): Struct = {
+    val apiKey = requestBuilder.apiKey
+    val request = requestBuilder.build()
+    val header = new RequestHeader(apiKey, request.version, clientId, correlationId)
+    val response = requestAndReceive(socket, request.serialize(header).array)
+    val responseBuffer = skipResponseHeader(response, apiKey.responseHeaderVersion(request.version()))
+    apiKey.parseResponse(request.version, responseBuffer)
+  }
+  
   /**
     * Serializes and sends the requestStruct to the given api.
     * A ByteBuffer containing the response (without the response header) is returned.
     */
-  def sendStruct(requestStruct: Struct, apiKey: ApiKeys, socket: Socket, apiVersion: Short): ByteBuffer = {
+  def sendStructAndReceive(requestStruct: Struct, apiKey: ApiKeys, socket: Socket, apiVersion: Short): ByteBuffer = {
     val header = nextRequestHeader(apiKey, apiVersion)
     val serializedBytes = AbstractRequestResponse.serialize(header.toStruct, requestStruct).array
     val response = requestAndReceive(socket, serializedBytes)
-    skipResponseHeader(response)
+    skipResponseHeader(response, apiKey.responseHeaderVersion(apiVersion))
   }
 
-  protected def skipResponseHeader(response: Array[Byte]): ByteBuffer = {
+  protected def skipResponseHeader(response: Array[Byte], responseHeaderVersion: Short): ByteBuffer = {
     val responseBuffer = ByteBuffer.wrap(response)
     // Parse the header to ensure its valid and move the buffer forward
-    ResponseHeader.parse(responseBuffer)
+    ResponseHeader.parse(responseBuffer, responseHeaderVersion)
     responseBuffer
   }
 

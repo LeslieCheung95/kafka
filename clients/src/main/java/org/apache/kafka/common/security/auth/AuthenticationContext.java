@@ -18,19 +18,25 @@ package org.apache.kafka.common.security.auth;
 
 import java.net.InetAddress;
 
+
 /**
  * An object representing contextual information from the authentication session. See
- * {@link SaslAuthenticationContext} and {@link SslAuthenticationContext}.
+ * {@link PlaintextAuthenticationContext}, {@link SaslAuthenticationContext}
+ * and {@link SslAuthenticationContext}. This class is only used in the broker.
  */
 public interface AuthenticationContext {
     /**
      * Underlying security protocol of the authentication session.
-     * @return The name of the security protocol (i.e. PLAINTEXT, SASL_PLAINTEXT, SASL_SSL, SSL)
      */
-    String securityProtocolName();
+    SecurityProtocol securityProtocol();
 
     /**
      * Address of the authenticated client
      */
     InetAddress clientAddress();
+
+    /**
+     * Name of the listener used for the connection
+     */
+    String listenerName();
 }

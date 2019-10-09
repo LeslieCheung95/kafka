@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.streams.processor.internals;
 
+import java.util.List;
 import org.apache.kafka.common.TopicPartition;
 
 import java.util.Collection;
@@ -24,7 +25,7 @@ import java.util.Map;
 /**
  * Performs bulk read operations from a set of partitions. Used to
  * restore  {@link org.apache.kafka.streams.processor.StateStore}s from their
- * change logs
+ * changelogs
  */
 public interface ChangelogReader {
     /**
@@ -37,12 +38,22 @@ public interface ChangelogReader {
      * Restore all registered state stores by reading from their changelogs.
      * @return all topic partitions that have been restored
      */
-    Collection<TopicPartition> restore();
+    Collection<TopicPartition> restore(final RestoringTasks active);
 
     /**
      * @return the restored offsets for all persistent stores.
      */
     Map<TopicPartition, Long> restoredOffsets();
 
-    void reset();
+    /**
+     * Removes the passed in partitions from the set of changelogs
+     * @param revokedPartitions the set of partitions to remove
+     */
+    void remove(List<TopicPartition> revokedPartitions);
+
+    /**
+     * Clear all partitions
+     */
+    void clear();
+
 }
